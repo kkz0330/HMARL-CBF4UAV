@@ -1,0 +1,7 @@
+﻿numpy==2.2.6
+gymnasium==1.2.3
+scipy==1.15.3
+pillow==12.1.1
+transforms3d==0.4.2
+setuptools<81
+gym-pybullet-drones @ git+https://github.com/utiasDSL/gym-pybullet-drones.git
