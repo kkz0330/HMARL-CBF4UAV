@@ -118,13 +118,59 @@ def build_policy_obs(
     raw_obs: np.ndarray,
     skill_targets: np.ndarray,
     use_delta_feature: bool = True,
+    normalize_obs: bool = True,
+    num_drones: int = 1,
+    max_sensed_obstacles: int = 3,
+    include_neighbor_features: bool = True,
+    pos_scale: float = 5.0,
+    vel_scale: float = 2.0,
+    clip_val: float = 5.0,
 ) -> np.ndarray:
-    obs = np.asarray(raw_obs, dtype=np.float32)
+    raw = np.asarray(raw_obs, dtype=np.float32)
+    obs = raw.copy()
+    if normalize_obs:
+        pos_scale = max(float(pos_scale), 1e-6)
+        vel_scale = max(float(vel_scale), 1e-6)
+        for i in range(int(num_drones)):
+            k = 0
+            obs[i, k : k + 3] /= pos_scale
+            k += 3
+            obs[i, k : k + 3] /= vel_scale
+            k += 3
+            obs[i, k : k + 3] /= pos_scale
+            k += 3
+
+            if include_neighbor_features:
+                for _ in range(int(num_drones) - 1):
+                    obs[i, k : k + 3] /= pos_scale
+                    k += 3
+                    obs[i, k] /= pos_scale
+                    k += 1
+
+            for _ in range(int(max_sensed_obstacles)):
+                obs[i, k : k + 3] /= pos_scale
+                k += 3
+                obs[i, k] /= pos_scale
+                k += 1
+            if k != obs.shape[1]:
+                raise ValueError(f"Unexpected observation shape: expected per-drone dim {k}, got {obs.shape[1]}")
+
+        if clip_val > 0.0:
+            obs = np.clip(obs, -float(clip_val), float(clip_val))
+
     if not use_delta_feature:
-        return obs
-    pos = obs[:, 0:3]
+        return obs.astype(np.float32)
+
+    pos = raw[:, 0:3]
     delta = np.asarray(skill_targets, dtype=np.float32) - pos
     dist = np.linalg.norm(delta, axis=1, keepdims=True).astype(np.float32)
+    if normalize_obs:
+        scale = max(float(pos_scale), 1e-6)
+        delta = delta / scale
+        dist = dist / scale
+        if clip_val > 0.0:
+            delta = np.clip(delta, -float(clip_val), float(clip_val))
+            dist = np.clip(dist, -float(clip_val), float(clip_val))
     return np.concatenate([obs, delta.astype(np.float32), dist], axis=1).astype(np.float32)
 
 
@@ -165,9 +211,19 @@ def main() -> None:
     parser.add_argument("--num-skills", type=int, default=7)
     parser.add_argument("--skill-set", type=str, default="0,1,2,3,4")
     parser.add_argument("--use-delta-feature", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--normalize-obs", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--obs-pos-scale", type=float, default=5.0)
+    parser.add_argument("--obs-vel-scale", type=float, default=2.0)
+    parser.add_argument("--obs-clip", type=float, default=5.0)
     parser.add_argument("--skill-period-min", type=int, default=40)
     parser.add_argument("--skill-period-max", type=int, default=60)
     parser.add_argument("--skill-stay-prob", type=float, default=0.85)
+    parser.add_argument(
+        "--lock-skill-per-episode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If enabled, keep each drone's sampled skill fixed for the whole episode.",
+    )
     parser.add_argument("--delta-x", type=float, default=0.30)
     parser.add_argument("--delta-y", type=float, default=0.45)
     parser.add_argument("--delta-z", type=float, default=0.25)
@@ -241,7 +297,12 @@ def main() -> None:
     obs_dim = obs_dim_raw + (4 if args.use_delta_feature else 0)
     model = SkillConditionedActorCritic(
         obs_local_dim=obs_dim,
-        cfg=SkillConditionedPolicyConfig(num_skills=args.num_skills, hidden_dim=256),
+        cfg=SkillConditionedPolicyConfig(
+            num_skills=args.num_skills,
+            hidden_dim=256,
+            action_scale_xy=env.cfg.max_target_speed_xy,
+            action_scale_z=env.cfg.max_target_speed_z,
+        ),
     ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=ppo_cfg.lr)
 
@@ -304,22 +365,34 @@ def main() -> None:
         for t in range(ppo_cfg.rollout_steps):
             # Asynchronous per-agent skill schedule with persistence.
             switched_mask = np.zeros((args.num_drones,), dtype=bool)
-            for i in range(args.num_drones):
-                if skill_ages[i] >= skill_periods[i]:
-                    if np.random.rand() > args.skill_stay_prob:
-                        current_skills[i] = int(np.random.choice(allowed_skills))
-                    skill_periods[i] = int(np.random.randint(args.skill_period_min, args.skill_period_max + 1))
-                    skill_ages[i] = 0
-                    switched_mask[i] = True
-                    switch_count += 1
+            if not args.lock_skill_per_episode:
+                for i in range(args.num_drones):
+                    if skill_ages[i] >= skill_periods[i]:
+                        if np.random.rand() > args.skill_stay_prob:
+                            current_skills[i] = int(np.random.choice(allowed_skills))
+                        skill_periods[i] = int(np.random.randint(args.skill_period_min, args.skill_period_max + 1))
+                        skill_ages[i] = 0
+                        switched_mask[i] = True
+                        switch_count += 1
 
-            tau_vec = (skill_ages / np.maximum(skill_periods - 1, 1)).astype(np.float32)
+            tau_vec = np.clip(skill_ages / np.maximum(skill_periods - 1, 1), 0.0, 1.0).astype(np.float32)
 
             desired_now = np.asarray(info["desired_positions"], dtype=np.float32)
             target_now = build_skill_targets(
                 desired_now, current_skills, args.delta_x, args.delta_y, args.delta_z
             )
-            policy_obs = build_policy_obs(obs, target_now, use_delta_feature=args.use_delta_feature)
+            policy_obs = build_policy_obs(
+                obs,
+                target_now,
+                use_delta_feature=args.use_delta_feature,
+                normalize_obs=args.normalize_obs,
+                num_drones=args.num_drones,
+                max_sensed_obstacles=env.cfg.max_sensed_obstacles,
+                include_neighbor_features=env.cfg.include_neighbor_features,
+                pos_scale=args.obs_pos_scale,
+                vel_scale=args.obs_vel_scale,
+                clip_val=args.obs_clip,
+            )
 
             obs_t = torch.as_tensor(policy_obs[None, ...], dtype=torch.float32, device=device)
             skill_t = torch.as_tensor(current_skills[None, ...], dtype=torch.long, device=device)
@@ -453,12 +526,23 @@ def main() -> None:
                 last_progress_dist_n[:] = err_reset.astype(np.float32)
 
         with torch.no_grad():
-            tau_vec = (skill_ages / np.maximum(skill_periods - 1, 1)).astype(np.float32)
+            tau_vec = np.clip(skill_ages / np.maximum(skill_periods - 1, 1), 0.0, 1.0).astype(np.float32)
             desired_last = np.asarray(info["desired_positions"], dtype=np.float32)
             target_last = build_skill_targets(
                 desired_last, current_skills, args.delta_x, args.delta_y, args.delta_z
             )
-            policy_obs_last = build_policy_obs(obs, target_last, use_delta_feature=args.use_delta_feature)
+            policy_obs_last = build_policy_obs(
+                obs,
+                target_last,
+                use_delta_feature=args.use_delta_feature,
+                normalize_obs=args.normalize_obs,
+                num_drones=args.num_drones,
+                max_sensed_obstacles=env.cfg.max_sensed_obstacles,
+                include_neighbor_features=env.cfg.include_neighbor_features,
+                pos_scale=args.obs_pos_scale,
+                vel_scale=args.obs_vel_scale,
+                clip_val=args.obs_clip,
+            )
             obs_t = torch.as_tensor(policy_obs_last[None, ...], dtype=torch.float32, device=device)
             skill_t = torch.as_tensor(current_skills[None, ...], dtype=torch.long, device=device)
             tau_t = torch.as_tensor(tau_vec[None, :, None], dtype=torch.float32, device=device)

@@ -14,6 +14,10 @@ class SkillConditionedPolicyConfig:
     num_skills: int = 7
     hidden_dim: int = 256
     init_log_std: float = -0.7
+    action_scale_xy: float = 1.0
+    action_scale_z: float = 1.0
+    log_std_min: float = -4.0
+    log_std_max: float = 0.5
 
 
 def skills_to_onehot(skill_idx: torch.Tensor, num_skills: int) -> torch.Tensor:
@@ -33,6 +37,13 @@ class SkillConditionedActorCritic(nn.Module):
         super().__init__()
         self.cfg = cfg or SkillConditionedPolicyConfig()
         in_dim = int(obs_local_dim + self.cfg.num_skills + 1)
+        self.register_buffer(
+            "action_scale",
+            torch.tensor(
+                [self.cfg.action_scale_xy, self.cfg.action_scale_xy, self.cfg.action_scale_z],
+                dtype=torch.float32,
+            ).view(1, 1, 3),
+        )
 
         self.backbone = nn.Sequential(
             nn.Linear(in_dim, self.cfg.hidden_dim),
@@ -62,9 +73,10 @@ class SkillConditionedActorCritic(nn.Module):
     def forward(self, obs_local: torch.Tensor, skill_idx: torch.Tensor, tau: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feat = self._build_features(obs_local, skill_idx, tau)
         h = self.backbone(feat)
-        mean = self.policy_head(h)
+        mean = torch.tanh(self.policy_head(h)) * self.action_scale
         value = self.value_head(h).squeeze(-1)
-        std = torch.exp(self.log_std).view(1, 1, 3).expand_as(mean)
+        log_std = torch.clamp(self.log_std, min=self.cfg.log_std_min, max=self.cfg.log_std_max)
+        std = torch.exp(log_std).view(1, 1, 3).expand_as(mean)
         return mean, std, value
 
     def act(
