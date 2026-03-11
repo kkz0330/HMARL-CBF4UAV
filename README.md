@@ -5,8 +5,10 @@ This project sets up the low-level simulation layer for UAV safe formation using
 ## Project Structure
 
 - `drone_env/formation_env.py`: gymnasium environment wrapper (`FormationAviaryEnv`)
+- `drone_env/local_obstacle_env.py`: local-observation obstacle environment (`LocalObstacleFormationEnv`)
 - `scripts/check_deps.py`: dependency checker
 - `scripts/run_formation_env.py`: rollout smoke test
+- `scripts/run_local_obstacle_env.py`: obstacle + local-observation rollout smoke test
 - `requirements.txt`: pinned runtime dependencies
 
 ## Recommended Environment
@@ -30,6 +32,7 @@ D:\anaconda\Scripts\conda.exe install -n drones310 -c conda-forge -y pybullet
 cd /d "D:\uav_safe_formation"
 & "D:\anaconda\envs\drones310\python.exe" .\scripts\check_deps.py
 & "D:\anaconda\envs\drones310\python.exe" .\scripts\run_formation_env.py --num-drones 3 --steps 200
+& "D:\anaconda\envs\drones310\python.exe" .\scripts\run_local_obstacle_env.py --num-drones 4 --scenario bridge_tree --steps 200
 ```
 
 ## RL + CBF-QP Wrapper
@@ -47,6 +50,12 @@ Quick demo:
 
 ```powershell
 & "D:\anaconda\envs\drones310\python.exe" .\scripts\run_with_diff_cbf_qp.py --num-drones 3 --steps 100
+```
+
+Stage-1 flat PPO training (u_nom -> CBF-QP -> env):
+
+```powershell
+& "D:\anaconda\envs\drones310\python.exe" .\scripts\train_stage1_ppo.py --num-drones 3 --total-updates 200 --rollout-steps 512
 ```
 
 ## Notes

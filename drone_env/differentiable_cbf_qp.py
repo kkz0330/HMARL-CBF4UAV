@@ -17,6 +17,7 @@ class DifferentiableCBFQPConfig:
     n_jobs_forward: int = 1
     n_jobs_backward: int = 1
     eps: float = 1e-5
+    max_iters: int = 5000
 
 
 class DifferentiableCBFQPSolver:
@@ -108,12 +109,22 @@ class DifferentiableCBFQPSolver:
 
         cbf_state_np = cbf_state_t.detach().cpu().numpy()
         A_np, b_np, _, _ = self._build_cbf_Ab(cbf_state_np)
+        if not np.isfinite(A_np).all() or not np.isfinite(b_np).all():
+            raise RuntimeError("Non-finite CBF matrices detected (A or b).")
 
-        u_nom = v_des_t.reshape(-1)
-        A = torch.as_tensor(A_np, dtype=u_nom.dtype, device=u_nom.device)
-        b = torch.as_tensor(b_np, dtype=u_nom.dtype, device=u_nom.device)
-        lb = torch.as_tensor(np.tile(self.vel_low, self.num_drones), dtype=u_nom.dtype, device=u_nom.device)
-        ub = torch.as_tensor(np.tile(self.vel_high, self.num_drones), dtype=u_nom.dtype, device=u_nom.device)
+        # diffcp+SCS is sensitive to dtype; float64 is significantly more stable than float32.
+        dtype = torch.float64
+        u_nom = v_des_t.reshape(-1).to(dtype=dtype)
+        A = torch.as_tensor(np.ascontiguousarray(A_np, dtype=np.float64), dtype=dtype, device=u_nom.device)
+        b = torch.as_tensor(np.ascontiguousarray(b_np, dtype=np.float64), dtype=dtype, device=u_nom.device)
+        lb = torch.as_tensor(np.tile(self.vel_low, self.num_drones), dtype=dtype, device=u_nom.device)
+        ub = torch.as_tensor(np.tile(self.vel_high, self.num_drones), dtype=dtype, device=u_nom.device)
+
+        solver_args = {
+            "solve_method": self.cfg.solve_method,
+            "eps": self.cfg.eps,
+            "max_iters": self.cfg.max_iters,
+        }
 
         u_safe, slack = self._layer(
             u_nom,
@@ -121,14 +132,9 @@ class DifferentiableCBFQPSolver:
             b,
             lb,
             ub,
-            solver_args={
-                "solve_method": self.cfg.solve_method,
-                "n_jobs_forward": self.cfg.n_jobs_forward,
-                "n_jobs_backward": self.cfg.n_jobs_backward,
-                "eps": self.cfg.eps,
-            },
+            solver_args=solver_args,
         )
-        return u_safe.reshape(self.num_drones, 3), slack
+        return u_safe.reshape(self.num_drones, 3).to(v_des_t.dtype), slack.to(v_des_t.dtype)
 
     def __call__(
         self, cbf_state: np.ndarray, v_des: np.ndarray, last_info: Dict[str, Any]
@@ -144,24 +150,28 @@ class DifferentiableCBFQPSolver:
 
         try:
             with torch.enable_grad():
-                u_nom = torch.as_tensor(v_des.reshape(-1), dtype=torch.float32, device=self.device)
-                A = torch.as_tensor(A_np, dtype=torch.float32, device=self.device)
-                b = torch.as_tensor(b_np, dtype=torch.float32, device=self.device)
-                lb = torch.as_tensor(np.tile(self.vel_low, self.num_drones), dtype=torch.float32, device=self.device)
-                ub = torch.as_tensor(np.tile(self.vel_high, self.num_drones), dtype=torch.float32, device=self.device)
+                if not np.isfinite(A_np).all() or not np.isfinite(b_np).all():
+                    return v_des, {"status": "invalid_cbf_matrix", "reason": "A or b contains non-finite values"}
 
+                dtype = torch.float64
+                u_nom = torch.as_tensor(v_des.reshape(-1), dtype=dtype, device=self.device)
+                A = torch.as_tensor(np.ascontiguousarray(A_np, dtype=np.float64), dtype=dtype, device=self.device)
+                b = torch.as_tensor(np.ascontiguousarray(b_np, dtype=np.float64), dtype=dtype, device=self.device)
+                lb = torch.as_tensor(np.tile(self.vel_low, self.num_drones), dtype=dtype, device=self.device)
+                ub = torch.as_tensor(np.tile(self.vel_high, self.num_drones), dtype=dtype, device=self.device)
+
+                solver_args = {
+                    "solve_method": self.cfg.solve_method,
+                    "eps": self.cfg.eps,
+                    "max_iters": self.cfg.max_iters,
+                }
                 u_safe, slack = self._layer(
                     u_nom,
                     A,
                     b,
                     lb,
                     ub,
-                    solver_args={
-                        "solve_method": self.cfg.solve_method,
-                        "n_jobs_forward": self.cfg.n_jobs_forward,
-                        "n_jobs_backward": self.cfg.n_jobs_backward,
-                        "eps": self.cfg.eps,
-                    },
+                    solver_args=solver_args,
                 )
             v_safe = u_safe.detach().cpu().numpy().reshape(self.num_drones, 3).astype(np.float32)
             slack_np = slack.detach().cpu().numpy().astype(np.float32)
