@@ -346,7 +346,7 @@ def main() -> None:
         cbf_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 6), dtype=np.float32)
         u_nom_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 3), dtype=np.float32)
         teacher_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 3), dtype=np.float32)
-        logp_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        logp_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones), dtype=np.float32)
         val_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         rew_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         done_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
@@ -404,7 +404,7 @@ def main() -> None:
 
             u_nom = out["u_nom"][0].cpu().numpy().astype(np.float32)
             u_safe = out["u_safe"][0].cpu().numpy().astype(np.float32)
-            logp_joint = float(out["logp_joint"][0].cpu().numpy())
+            logp_agent = out["logp"][0].cpu().numpy().astype(np.float32)
             value_joint = float(out["value_joint"][0].cpu().numpy())
             slack_aux = float(out["slack_aux"][0].cpu().numpy()) if args.diff_qp else 0.0
             qp_fail_count = int(out.get("qp_fail_count", torch.zeros((1,), dtype=torch.int32))[0].cpu().item())
@@ -483,7 +483,7 @@ def main() -> None:
             tau_buf[t, :, 0] = tau_vec
             cbf_buf[t] = cbf_state
             u_nom_buf[t] = u_nom
-            logp_buf[t] = logp_joint
+            logp_buf[t] = logp_agent
             val_buf[t] = value_joint
             rew_buf[t] = reward
             done_buf[t] = float(done)
@@ -583,12 +583,14 @@ def main() -> None:
                 mean_b, std_b, value_agent_b = model.forward(b_obs, b_skill, b_tau)
                 value_b = value_agent_b.mean(dim=-1)
                 dist_b = Normal(mean_b, std_b)
-                logp_b = dist_b.log_prob(b_nom).sum(dim=-1).sum(dim=-1)
-                entropy_b = dist_b.entropy().sum(dim=-1).sum(dim=-1).mean()
+                # Per-agent PPO ratio (MAPPO-style), avoid high-dimensional joint log-prob explosion.
+                logp_b = dist_b.log_prob(b_nom).sum(dim=-1)  # (B, N)
+                entropy_b = dist_b.entropy().sum(dim=-1).mean()
 
-                ratio = torch.exp(logp_b - b_old_logp)
-                surr1 = ratio * b_adv
-                surr2 = torch.clamp(ratio, 1.0 - ppo_cfg.clip_ratio, 1.0 + ppo_cfg.clip_ratio) * b_adv
+                b_adv_expanded = b_adv.unsqueeze(1).expand(-1, args.num_drones)
+                ratio = torch.exp(logp_b - b_old_logp)  # (B, N)
+                surr1 = ratio * b_adv_expanded
+                surr2 = torch.clamp(ratio, 1.0 - ppo_cfg.clip_ratio, 1.0 + ppo_cfg.clip_ratio) * b_adv_expanded
                 policy_loss = -torch.min(surr1, surr2).mean()
                 value_loss = 0.5 * ((value_b - b_ret) ** 2).mean()
 
