@@ -90,6 +90,10 @@ def main() -> None:
     parser.add_argument("--use-cbf-qp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cbf-alpha", type=float, default=4.0)
     parser.add_argument("--cbf-slack-weight", type=float, default=120.0)
+    parser.add_argument("--enable-clf", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--clf-rate", type=float, default=1.0)
+    parser.add_argument("--clf-deadzone", type=float, default=0.05)
+    parser.add_argument("--clf-slack-weight", type=float, default=20.0)
     parser.add_argument("--episode-len-sec", type=float, default=20.0)
     parser.add_argument("--gui", action="store_true", default=False)
     parser.add_argument("--keep-gui", action=argparse.BooleanOptionalAction, default=True)
@@ -128,6 +132,10 @@ def main() -> None:
                 safe_distance=cfg.safe_distance,
                 slack_weight=args.cbf_slack_weight,
                 enforce_obstacle_constraints=True,
+                enable_clf=args.enable_clf,
+                clf_rate=args.clf_rate,
+                clf_deadzone=args.clf_deadzone,
+                clf_slack_weight=args.clf_slack_weight,
             ),
         )
         env = RLCBFQPWrapper(base_env, qp_solver=qp_solver)

@@ -21,6 +21,7 @@ from drone_env import (  # noqa: E402
     SkillConditionedActorCritic,
     SkillConditionedPolicyConfig,
     build_solver_from_velocity_bounds,
+    skill_velocity_alignment_reward,
 )
 
 
@@ -108,10 +109,45 @@ def build_skill_targets(
         elif zi == 4:
             target[i, 2] -= float(delta_z)  # down
         elif zi == 5:
-            target[i, 0] += float(delta_x)  # forward
+            # accelerate: no positional offset, handled by speed CLF
+            pass
         elif zi == 6:
-            target[i, 0] -= float(delta_x)  # backward
+            # decelerate: no positional offset, handled by speed CLF
+            pass
     return target
+
+
+def build_skill_reference_velocity(
+    skill_idx: np.ndarray,
+    cruise_speed: float,
+    accelerate_speed: float,
+    decelerate_speed: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Reference heading (unit vector) and speed per skill."""
+    z = np.asarray(skill_idx, dtype=np.int64).reshape(-1)
+    n = z.shape[0]
+    ref_dir = np.zeros((n, 3), dtype=np.float32)
+    ref_speed = np.full((n,), float(cruise_speed), dtype=np.float32)
+    for i in range(n):
+        zi = int(z[i])
+        if zi == 1:
+            ref_dir[i] = np.array([0.0, -1.0, 0.0], dtype=np.float32)  # left
+        elif zi == 2:
+            ref_dir[i] = np.array([0.0, 1.0, 0.0], dtype=np.float32)  # right
+        elif zi == 3:
+            ref_dir[i] = np.array([0.0, 0.0, 1.0], dtype=np.float32)  # up
+        elif zi == 4:
+            ref_dir[i] = np.array([0.0, 0.0, -1.0], dtype=np.float32)  # down
+        else:
+            ref_dir[i] = np.array([1.0, 0.0, 0.0], dtype=np.float32)  # cruise/accelerate/decelerate
+
+        if zi == 5:
+            ref_speed[i] = float(accelerate_speed)
+        elif zi == 6:
+            ref_speed[i] = float(decelerate_speed)
+        else:
+            ref_speed[i] = float(cruise_speed)
+    return ref_dir, ref_speed
 
 
 def build_policy_obs(
@@ -209,7 +245,7 @@ def main() -> None:
     parser.add_argument("--total-updates", type=int, default=120)
     parser.add_argument("--rollout-steps", type=int, default=256)
     parser.add_argument("--num-skills", type=int, default=7)
-    parser.add_argument("--skill-set", type=str, default="0,1,2,3,4")
+    parser.add_argument("--skill-set", type=str, default="0,1,2,3,4,5,6")
     parser.add_argument("--use-delta-feature", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--normalize-obs", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--obs-pos-scale", type=float, default=5.0)
@@ -240,16 +276,38 @@ def main() -> None:
     parser.add_argument("--episode-len-sec", type=float, default=20.0)
     parser.add_argument("--bridge-offset-y", type=float, default=0.40)
     parser.add_argument("--diff-qp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--qp-enable-clf", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--qp-clf-mode", type=str, default="skill", choices=["position", "skill"])
+    parser.add_argument("--qp-clf-rate", type=float, default=1.0)
+    parser.add_argument("--qp-heading-clf-rate", type=float, default=2.0)
+    parser.add_argument("--qp-clf-deadzone", type=float, default=0.05)
+    parser.add_argument("--qp-speed-clf-deadzone", type=float, default=0.08)
+    parser.add_argument("--qp-heading-clf-deadzone", type=float, default=0.08)
+    parser.add_argument("--qp-clf-slack-weight", type=float, default=80.0)
+    parser.add_argument("--skill-cruise-speed", type=float, default=0.5)
+    parser.add_argument("--skill-accelerate-speed", type=float, default=0.9)
+    parser.add_argument("--skill-decelerate-speed", type=float, default=0.2)
     parser.add_argument("--w-skill", type=float, default=1.0)
+    parser.add_argument("--w-align", type=float, default=0.8)
+    parser.add_argument("--align-distance-gating", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--align-gate-near", type=float, default=0.25)
+    parser.add_argument("--align-gate-far", type=float, default=1.20)
+    parser.add_argument("--align-gate-min", type=float, default=0.0)
     parser.add_argument("--w-smooth", type=float, default=0.10)
-    parser.add_argument("--w-intervene", type=float, default=0.10)
-    parser.add_argument("--w-slack", type=float, default=0.10)
+    parser.add_argument("--w-intervene", type=float, default=0.02)
+    parser.add_argument("--w-slack", type=float, default=0.50)
     parser.add_argument("--w-skill-err", type=float, default=0.05)
-    parser.add_argument("--w-speed", type=float, default=0.01)
+    parser.add_argument("--w-speed", type=float, default=0.005)
     parser.add_argument("--w-qp-fail", type=float, default=0.10)
     parser.add_argument("--w-safety", type=float, default=2.0)
     parser.add_argument("--w-contact", type=float, default=6.0)
     parser.add_argument("--w-env", type=float, default=0.0)
+    parser.add_argument("--w-progress", type=float, default=0.25)
+    parser.add_argument("--w-accel-pen", type=float, default=0.15)
+    parser.add_argument("--w-turn-pen", type=float, default=0.20)
+    parser.add_argument("--w-speed-ref-pen", type=float, default=0.45)
+    parser.add_argument("--w-heading-ref-pen", type=float, default=0.40)
+    parser.add_argument("--w-pos-pen", type=float, default=0.20)
     parser.add_argument("--debug-progress-reward", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--debug-progress-scale", type=float, default=10.0)
     parser.add_argument("--debug-goal-threshold", type=float, default=0.10)
@@ -273,6 +331,14 @@ def main() -> None:
         raise SystemExit("skill-stay-prob must be in [0,1]")
     if args.num_skills <= 0:
         raise SystemExit("num-skills must be positive")
+    if args.skill_cruise_speed < 0.0 or args.skill_accelerate_speed < 0.0 or args.skill_decelerate_speed < 0.0:
+        raise SystemExit("skill speeds must be non-negative")
+    if not (args.skill_decelerate_speed <= args.skill_cruise_speed <= args.skill_accelerate_speed):
+        raise SystemExit("Require decelerate_speed <= cruise_speed <= accelerate_speed")
+    if args.align_gate_far <= args.align_gate_near:
+        raise SystemExit("align-gate-far must be larger than align-gate-near")
+    if not (0.0 <= args.align_gate_min <= 1.0):
+        raise SystemExit("align-gate-min must be in [0,1]")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -318,6 +384,17 @@ def main() -> None:
                 solve_method="SCS",
                 n_jobs_forward=1,
                 n_jobs_backward=1,
+                enable_clf=args.qp_enable_clf,
+                clf_mode=args.qp_clf_mode,
+                clf_rate=args.qp_clf_rate,
+                heading_clf_rate=args.qp_heading_clf_rate,
+                clf_deadzone=args.qp_clf_deadzone,
+                speed_clf_deadzone=args.qp_speed_clf_deadzone,
+                heading_clf_deadzone=args.qp_heading_clf_deadzone,
+                clf_slack_weight=args.qp_clf_slack_weight,
+                cruise_speed=args.skill_cruise_speed,
+                accelerate_speed=args.skill_accelerate_speed,
+                decelerate_speed=args.skill_decelerate_speed,
             ),
             device=args.device,
         )
@@ -344,6 +421,7 @@ def main() -> None:
         skill_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones), dtype=np.int64)
         tau_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 1), dtype=np.float32)
         cbf_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 6), dtype=np.float32)
+        target_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 3), dtype=np.float32)
         u_nom_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 3), dtype=np.float32)
         teacher_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 3), dtype=np.float32)
         logp_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones), dtype=np.float32)
@@ -351,6 +429,15 @@ def main() -> None:
         rew_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         done_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         skill_score_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        align_raw_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        align_gate_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        align_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        progress_x_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        accel_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        turn_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        speed_ref_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        heading_ref_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        pos_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         skill_prog_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         skill_err_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         slack_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
@@ -398,9 +485,21 @@ def main() -> None:
             skill_t = torch.as_tensor(current_skills[None, ...], dtype=torch.long, device=device)
             tau_t = torch.as_tensor(tau_vec[None, :, None], dtype=torch.float32, device=device)
             cbf_t = torch.as_tensor(cbf_state[None, ...], dtype=torch.float32, device=device)
+            target_t = torch.as_tensor(target_now[None, ...], dtype=torch.float32, device=device)
+            target_vel_t = torch.zeros_like(target_t)
 
             with torch.no_grad():
-                out = model.act(obs_t, skill_t, tau_t, cbf_t, qp_solver=qp_solver, deterministic=False)
+                out = model.act(
+                    obs_t,
+                    skill_t,
+                    tau_t,
+                    cbf_t,
+                    qp_target_pos=target_t,
+                    qp_target_vel=target_vel_t,
+                    qp_skill_idx=skill_t,
+                    qp_solver=qp_solver,
+                    deterministic=False,
+                )
 
             u_nom = out["u_nom"][0].cpu().numpy().astype(np.float32)
             u_safe = out["u_safe"][0].cpu().numpy().astype(np.float32)
@@ -421,6 +520,8 @@ def main() -> None:
             desired_next = np.asarray(next_info["desired_positions"], dtype=np.float32)
             pos_now = np.asarray(obs[:, 0:3], dtype=np.float32)
             pos_next = np.asarray(next_obs[:, 0:3], dtype=np.float32)
+            vel_now = np.asarray(obs[:, 3:6], dtype=np.float32)
+            vel_next = np.asarray(next_obs[:, 3:6], dtype=np.float32)
             target_next = build_skill_targets(
                 desired_next, current_skills, args.delta_x, args.delta_y, args.delta_z
             )
@@ -428,8 +529,49 @@ def main() -> None:
             err_next = np.linalg.norm(pos_next - target_next, axis=1)
             skill_progress = float(np.mean(np.clip(err_now - err_next, -0.2, 0.2)))
             mean_err_next = float(np.mean(err_next))
-            skill_target = float(np.exp(-(mean_err_next**2) / (2.0 * args.skill_target_sigma**2)))
-            skill_score = 1.5 * skill_progress + skill_target
+            align_reward_raw = float(
+                skill_velocity_alignment_reward(
+                    u_safe,
+                    current_skills,
+                    cruise_speed=args.skill_cruise_speed,
+                    accelerate_speed=args.skill_accelerate_speed,
+                    decelerate_speed=args.skill_decelerate_speed,
+                )
+            )
+            if args.align_distance_gating:
+                gate = (mean_err_next - float(args.align_gate_near)) / max(
+                    float(args.align_gate_far - args.align_gate_near), 1e-6
+                )
+                gate = float(np.clip(gate, 0.0, 1.0))
+                gate = float(args.align_gate_min) + (1.0 - float(args.align_gate_min)) * gate
+            else:
+                gate = 1.0
+            align_reward = gate * align_reward_raw
+            skill_score = align_reward
+
+            # Intrinsic terms: mostly penalties + small forward progress reward.
+            forward_progress = float(np.mean(np.clip(pos_next[:, 0] - pos_now[:, 0], -0.10, 0.10)))
+            accel_pen = float(np.mean(np.sum((vel_next - vel_now) ** 2, axis=1)))
+
+            v_now_norm = np.linalg.norm(vel_now, axis=1)
+            v_next_norm = np.linalg.norm(vel_next, axis=1)
+            dot_turn = np.sum(vel_now * vel_next, axis=1)
+            cos_turn = dot_turn / (v_now_norm * v_next_norm + 1e-6)
+            cos_turn = np.clip(cos_turn, -1.0, 1.0)
+            # map to [0,1], small when heading changes are smooth
+            turn_pen = float(np.mean(0.5 * (1.0 - cos_turn)))
+
+            ref_dir, ref_speed = build_skill_reference_velocity(
+                current_skills,
+                cruise_speed=args.skill_cruise_speed,
+                accelerate_speed=args.skill_accelerate_speed,
+                decelerate_speed=args.skill_decelerate_speed,
+            )
+            speed_ref_pen = float(np.mean((v_next_norm - ref_speed) ** 2))
+            cos_ref = np.sum(vel_next * ref_dir, axis=1) / (v_next_norm + 1e-6)
+            cos_ref = np.clip(cos_ref, -1.0, 1.0)
+            heading_ref_pen = float(np.mean(0.5 * (1.0 - cos_ref)))
+            pos_pen = float(mean_err_next)
 
             pair_margin = float(next_info["min_pairwise_distance"] - env.cfg.safe_distance)
             obs_clear = float(next_info["min_obstacle_clearance"])
@@ -442,8 +584,13 @@ def main() -> None:
 
             reward = (
                 args.w_env * float(env_reward)
-                + args.w_skill * skill_score
-                - args.w_skill_err * mean_err_next
+                + args.w_progress * forward_progress
+                + args.w_align * align_reward
+                - args.w_accel_pen * accel_pen
+                - args.w_turn_pen * turn_pen
+                - args.w_speed_ref_pen * speed_ref_pen
+                - args.w_heading_ref_pen * heading_ref_pen
+                - args.w_pos_pen * pos_pen
                 - args.w_smooth * smooth_pen
                 - args.w_intervene * intervene_pen
                 - args.w_slack * slack_aux
@@ -482,12 +629,22 @@ def main() -> None:
             skill_buf[t] = current_skills
             tau_buf[t, :, 0] = tau_vec
             cbf_buf[t] = cbf_state
+            target_buf[t] = target_now
             u_nom_buf[t] = u_nom
             logp_buf[t] = logp_agent
             val_buf[t] = value_joint
             rew_buf[t] = reward
             done_buf[t] = float(done)
             skill_score_buf[t] = skill_score
+            align_raw_buf[t] = align_reward_raw
+            align_gate_buf[t] = gate
+            align_buf[t] = align_reward
+            progress_x_buf[t] = forward_progress
+            accel_pen_buf[t] = accel_pen
+            turn_pen_buf[t] = turn_pen
+            speed_ref_pen_buf[t] = speed_ref_pen
+            heading_ref_pen_buf[t] = heading_ref_pen
+            pos_pen_buf[t] = pos_pen
             skill_prog_buf[t] = skill_progress
             skill_err_buf[t] = mean_err_next
             slack_buf[t] = slack_aux
@@ -501,9 +658,6 @@ def main() -> None:
             cbf_state = np.asarray(next_info["cbf_state"], dtype=np.float32)
             prev_u_safe = u_safe
             skill_ages += 1
-
-            if mean_err_next > args.reset_err_threshold:
-                done = True
 
             if done:
                 recent_returns.append(ep_return)
@@ -563,6 +717,7 @@ def main() -> None:
         skill_t = torch.as_tensor(skill_buf, dtype=torch.long, device=device)
         tau_t = torch.as_tensor(tau_buf, dtype=torch.float32, device=device)
         cbf_t = torch.as_tensor(cbf_buf, dtype=torch.float32, device=device)
+        target_t = torch.as_tensor(target_buf, dtype=torch.float32, device=device)
         u_nom_t = torch.as_tensor(u_nom_buf, dtype=torch.float32, device=device)
         old_logp_t = torch.as_tensor(logp_buf, dtype=torch.float32, device=device)
         ret_t = torch.as_tensor(ret, dtype=torch.float32, device=device)
@@ -575,6 +730,7 @@ def main() -> None:
                 b_skill = skill_t[idx]
                 b_tau = tau_t[idx]
                 b_cbf = cbf_t[idx]
+                b_target = target_t[idx]
                 b_nom = u_nom_t[idx]
                 b_old_logp = old_logp_t[idx]
                 b_ret = ret_t[idx]
@@ -600,7 +756,13 @@ def main() -> None:
                     slack_list = []
                     for j in range(mean_b.shape[0]):
                         try:
-                            u_safe_j, slack_j = qp_solver.solve_torch(b_cbf[j], mean_b[j])
+                            u_safe_j, slack_j = qp_solver.solve_torch(
+                                b_cbf[j],
+                                mean_b[j],
+                                target_pos_t=b_target[j],
+                                target_vel_t=torch.zeros_like(b_target[j]),
+                                skill_idx_t=b_skill[j],
+                            )
                         except Exception:
                             u_safe_j = mean_b[j]
                             slack_j = torch.zeros((1,), dtype=mean_b.dtype, device=mean_b.device)
@@ -627,6 +789,15 @@ def main() -> None:
         print(
             f"update={update:04d} avg_return_10={avg_return:.3f} "
             f"rollout_skill_score={float(np.mean(skill_score_buf)):.3f} "
+            f"rollout_align_raw={float(np.mean(align_raw_buf)):.3f} "
+            f"rollout_align_gate={float(np.mean(align_gate_buf)):.3f} "
+            f"rollout_align={float(np.mean(align_buf)):.3f} "
+            f"rollout_prog_x={float(np.mean(progress_x_buf)):.4f} "
+            f"rollout_accel_pen={float(np.mean(accel_pen_buf)):.4f} "
+            f"rollout_turn_pen={float(np.mean(turn_pen_buf)):.4f} "
+            f"rollout_speed_ref_pen={float(np.mean(speed_ref_pen_buf)):.4f} "
+            f"rollout_heading_ref_pen={float(np.mean(heading_ref_pen_buf)):.4f} "
+            f"rollout_pos_pen={float(np.mean(pos_pen_buf)):.4f} "
             f"rollout_skill_progress={float(np.mean(skill_prog_buf)):.4f} "
             f"rollout_skill_err={float(np.mean(skill_err_buf)):.3f} "
             f"rollout_intervene={float(np.mean(intervene_buf)):.4f} "

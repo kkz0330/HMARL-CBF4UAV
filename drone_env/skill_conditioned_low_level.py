@@ -85,6 +85,9 @@ class SkillConditionedActorCritic(nn.Module):
         skill_idx: torch.Tensor,
         tau: torch.Tensor,
         cbf_state: torch.Tensor,
+        qp_target_pos: torch.Tensor | None = None,
+        qp_target_vel: torch.Tensor | None = None,
+        qp_skill_idx: torch.Tensor | None = None,
         qp_solver=None,
         deterministic: bool = False,
     ) -> Dict[str, torch.Tensor]:
@@ -105,7 +108,16 @@ class SkillConditionedActorCritic(nn.Module):
             qp_fail_count = 0
             for b in range(u_nom.shape[0]):
                 try:
-                    u_b, s_b = qp_solver.solve_torch(cbf_state[b], u_nom[b])
+                    target_b = None if qp_target_pos is None else qp_target_pos[b]
+                    target_vel_b = None if qp_target_vel is None else qp_target_vel[b]
+                    skill_b = None if qp_skill_idx is None else qp_skill_idx[b]
+                    u_b, s_b = qp_solver.solve_torch(
+                        cbf_state[b],
+                        u_nom[b],
+                        target_pos_t=target_b,
+                        target_vel_t=target_vel_b,
+                        skill_idx_t=skill_b,
+                    )
                 except Exception:
                     # Fallback to nominal action for this sample to keep training loop alive.
                     u_b = u_nom[b]
@@ -134,28 +146,50 @@ class SkillConditionedActorCritic(nn.Module):
         }
 
 
-def skill_velocity_alignment_reward(v_safe: np.ndarray, skill_idx: np.ndarray) -> float:
-    """Simple intrinsic reward encouraging velocity alignment with skill command."""
+def skill_velocity_alignment_reward(
+    v_safe: np.ndarray,
+    skill_idx: np.ndarray,
+    cruise_speed: float = 0.5,
+    accelerate_speed: float = 0.9,
+    decelerate_speed: float = 0.2,
+) -> float:
+    """Intrinsic reward for skill execution in velocity space.
+
+    Skill mapping:
+      0 cruise, 1 left, 2 right, 3 up, 4 down, 5 accelerate, 6 decelerate
+    """
     pref = np.array(
         [
-            [0.0, 0.0, 0.0],   # keep
+            [1.0, 0.0, 0.0],   # cruise (forward)
             [0.0, -1.0, 0.0],  # left
             [0.0, 1.0, 0.0],   # right
             [0.0, 0.0, 1.0],   # up
             [0.0, 0.0, -1.0],  # down
-            [1.0, 0.0, 0.0],   # forward
-            [-1.0, 0.0, 0.0],  # backward
+            [1.0, 0.0, 0.0],   # accelerate (forward faster)
+            [1.0, 0.0, 0.0],   # decelerate (forward slower)
         ],
         dtype=np.float32,
     )
     v = np.asarray(v_safe, dtype=np.float32)
     z = np.asarray(skill_idx, dtype=np.int64).reshape(-1)
     eps = 1e-6
+    speed_sigma = 0.25
     vals = []
     for i in range(v.shape[0]):
-        p = pref[int(z[i])]
-        if int(z[i]) == 0:
-            vals.append(float(np.exp(-np.linalg.norm(v[i]) ** 2)))
+        zi = int(z[i])
+        p = pref[zi]
+        if zi in (0, 5, 6):
+            if zi == 0:
+                speed_ref = float(cruise_speed)
+            elif zi == 5:
+                speed_ref = float(accelerate_speed)
+            else:
+                speed_ref = float(decelerate_speed)
+            v_forward = float(v[i, 0])
+            v_lat = float(np.linalg.norm(v[i, 1:3]))
+            speed_term = float(np.exp(-((v_forward - speed_ref) ** 2) / (2.0 * speed_sigma**2)))
+            lat_pen = 0.2 * v_lat
+            vals.append(float(np.clip(speed_term - lat_pen, -1.0, 1.0)))
         else:
             vals.append(float(np.dot(v[i], p) / (np.linalg.norm(v[i]) + eps)))
     return float(np.mean(vals))

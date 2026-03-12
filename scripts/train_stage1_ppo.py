@@ -140,6 +140,10 @@ def main():
         default=False,
         help="Use cvxpylayers/diffcp differentiable QP (recommended in WSL/Linux, unstable on Windows).",
     )
+    parser.add_argument("--qp-enable-clf", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--qp-clf-rate", type=float, default=1.0)
+    parser.add_argument("--qp-clf-deadzone", type=float, default=0.05)
+    parser.add_argument("--qp-clf-slack-weight", type=float, default=20.0)
     args = parser.parse_args()
 
     if os.name == "nt" and args.diff_qp:
@@ -177,6 +181,10 @@ def main():
                 solve_method="SCS",
                 n_jobs_forward=1,
                 n_jobs_backward=1,
+                enable_clf=args.qp_enable_clf,
+                clf_rate=args.qp_clf_rate,
+                clf_deadzone=args.qp_clf_deadzone,
+                clf_slack_weight=args.qp_clf_slack_weight,
             ),
             device=args.device,
         )
@@ -207,6 +215,7 @@ def main():
     for update in range(1, args.total_updates + 1):
         obs_buf = np.zeros((ppo_cfg.rollout_steps, obs_dim), dtype=np.float32)
         cbf_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 6), dtype=np.float32)
+        target_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 3), dtype=np.float32)
         act_buf = np.zeros((ppo_cfg.rollout_steps, action_dim), dtype=np.float32)
         logp_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         rew_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
@@ -223,10 +232,12 @@ def main():
             logp_t = dist.log_prob(u_nom_flat).sum(dim=-1)
             u_nom = u_nom_flat.reshape(args.num_drones, 3)
             u_nom_np = u_nom.detach().cpu().numpy()
+            desired_now = np.asarray(info.get("desired_positions"), dtype=np.float32)
 
             if use_diff_qp:
                 cbf_t = torch.as_tensor(cbf_state, dtype=torch.float32, device=device)
-                u_safe, slack = solver.solve_torch(cbf_t, u_nom)
+                target_t = torch.as_tensor(desired_now, dtype=torch.float32, device=device)
+                u_safe, slack = solver.solve_torch(cbf_t, u_nom, target_pos_t=target_t)
                 action_np = u_safe.detach().cpu().numpy().astype(np.float32)
                 slack_norm = float(np.linalg.norm(slack.detach().cpu().numpy()))
             else:
@@ -240,6 +251,7 @@ def main():
 
             obs_buf[t] = obs
             cbf_buf[t] = cbf_state
+            target_buf[t] = desired_now
             act_buf[t] = u_nom_flat.detach().cpu().numpy()[0]
             logp_buf[t] = float(logp_t.detach().cpu().numpy()[0])
             val_buf[t] = float(value_t.detach().cpu().numpy()[0])
@@ -279,6 +291,7 @@ def main():
 
         obs_t = torch.as_tensor(obs_buf, dtype=torch.float32, device=device)
         cbf_t = torch.as_tensor(cbf_buf, dtype=torch.float32, device=device)
+        target_t = torch.as_tensor(target_buf, dtype=torch.float32, device=device)
         act_t = torch.as_tensor(act_buf, dtype=torch.float32, device=device)
         old_logp_t = torch.as_tensor(logp_buf, dtype=torch.float32, device=device)
         ret_t = torch.as_tensor(ret, dtype=torch.float32, device=device)
@@ -290,6 +303,7 @@ def main():
             for idx in batch_indices(ppo_cfg.rollout_steps, ppo_cfg.minibatch_size):
                 b_obs = obs_t[idx]
                 b_cbf = cbf_t[idx]
+                b_target = target_t[idx]
                 b_act = act_t[idx]
                 b_old_logp = old_logp_t[idx]
                 b_ret = ret_t[idx]
@@ -314,11 +328,12 @@ def main():
                     for j in range(b_obs.shape[0]):
                         u_nom_j = mean_b[j].reshape(args.num_drones, 3)
                         cbf_j = b_cbf[j]
-                        u_safe_j, slack_j = solver.solve_torch(cbf_j, u_nom_j)
+                        target_j = b_target[j]
+                        u_safe_j, slack_j = solver.solve_torch(cbf_j, u_nom_j, target_pos_t=target_j)
                         qp_aux = qp_aux + torch.mean((u_safe_j - u_nom_j) ** 2) + 0.1 * torch.mean(slack_j**2)
 
                         u_probe = u_nom_j.detach().clone().requires_grad_(True)
-                        u_safe_probe, _ = solver.solve_torch(cbf_j, u_probe)
+                        u_safe_probe, _ = solver.solve_torch(cbf_j, u_probe, target_pos_t=target_j)
                         g = torch.autograd.grad(u_safe_probe.sum(), u_probe, retain_graph=False, create_graph=False)[0]
                         qp_grad_probe = qp_grad_probe + torch.mean(torch.abs(g.detach()))
                     qp_aux = qp_aux / b_obs.shape[0]

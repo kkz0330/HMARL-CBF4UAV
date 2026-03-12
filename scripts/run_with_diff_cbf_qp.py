@@ -24,6 +24,10 @@ def main():
     parser.add_argument("--steps", type=int, default=150)
     parser.add_argument("--gui", action="store_true", default=False)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--enable-clf", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--clf-rate", type=float, default=1.0)
+    parser.add_argument("--clf-deadzone", type=float, default=0.05)
+    parser.add_argument("--clf-slack-weight", type=float, default=20.0)
     args = parser.parse_args()
 
     base_env = FormationAviaryEnv(FormationEnvConfig(num_drones=args.num_drones, gui=args.gui))
@@ -31,7 +35,13 @@ def main():
         num_drones=args.num_drones,
         max_speed_xy=base_env.cfg.max_target_speed_xy,
         max_speed_z=base_env.cfg.max_target_speed_z,
-        config=DifferentiableCBFQPConfig(safe_distance=base_env.cfg.safe_distance),
+        config=DifferentiableCBFQPConfig(
+            safe_distance=base_env.cfg.safe_distance,
+            enable_clf=args.enable_clf,
+            clf_rate=args.clf_rate,
+            clf_deadzone=args.clf_deadzone,
+            clf_slack_weight=args.clf_slack_weight,
+        ),
         device=args.device,
     )
     env = RLCBFQPWrapper(base_env, qp_solver=solver)

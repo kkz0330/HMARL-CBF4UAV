@@ -1,4 +1,9 @@
-from .cbf_qp_matrix import compute_cbf_matrices_centralized, compute_cbf_matrices_distributed
+from .cbf_qp_matrix import (
+    compute_cbf_matrices_centralized,
+    compute_cbf_matrices_distributed,
+    compute_clf_tracking_matrices_centralized,
+    compute_skill_clf_matrices_centralized,
+)
 from .formation_env import FormationAviaryEnv, FormationEnvConfig
 from .local_obstacle_env import LocalObstacleEnvConfig, LocalObstacleFormationEnv
 from .cbf_qp_safety_filter import CBFQPSafetyFilter, CBFQPSafetyFilterConfig
@@ -31,4 +36,6 @@ __all__ = [
     "build_solver_from_velocity_bounds",
     "compute_cbf_matrices_centralized",
     "compute_cbf_matrices_distributed",
+    "compute_clf_tracking_matrices_centralized",
+    "compute_skill_clf_matrices_centralized",
 ]
