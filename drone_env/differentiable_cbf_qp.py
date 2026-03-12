@@ -16,7 +16,7 @@ from .cbf_qp_matrix import (
 class DifferentiableCBFQPConfig:
     alpha: float = 4.0
     safe_distance: float = 0.22
-    slack_weight: float = 50.0
+    slack_weight: float = 50.0  # deprecated, kept for backward compatibility
     solve_method: str = "SCS"
     n_jobs_forward: int = 1
     n_jobs_backward: int = 1
@@ -26,13 +26,17 @@ class DifferentiableCBFQPConfig:
     clf_rate: float = 1.0
     clf_deadzone: float = 0.05
     clf_slack_weight: float = 20.0
+    clf_slack_l2_weight: float = 1e-4
     clf_mode: str = "position"  # "position" | "skill"
     cruise_speed: float = 0.5
-    accelerate_speed: float = 0.9
+    accelerate_speed: float = 0.2
     decelerate_speed: float = 0.2
+    skill_speed_cap: float = 1.0
     heading_clf_rate: float = 2.0
     speed_clf_deadzone: float = 0.08
     heading_clf_deadzone: float = 0.08
+    qp_h_min: float = 1e-3
+    max_obstacle_constraints_per_drone: int = 0
 
 
 class DifferentiableCBFQPSolver:
@@ -60,6 +64,8 @@ class DifferentiableCBFQPSolver:
             raise ValueError("vel_low must be strictly smaller than vel_high per dimension.")
 
         self.num_pairs = self.num_drones * (self.num_drones - 1) // 2
+        self.max_obs_constraints_per_drone = max(int(self.cfg.max_obstacle_constraints_per_drone), 0)
+        self.num_obs_constraints = self.num_drones * self.max_obs_constraints_per_drone
         self.action_dim = 3 * self.num_drones
 
         self._torch = None
@@ -77,39 +83,92 @@ class DifferentiableCBFQPSolver:
             ) from exc
 
         u = cp.Variable(self.action_dim)  # stacked [vx1, vy1, vz1, ..., vxN, vyN, vzN]
-        slack_cbf = cp.Variable(self.num_pairs, nonneg=True)
         slack_clf = cp.Variable(self.num_drones, nonneg=True)
 
-        u_nom = cp.Parameter(self.action_dim)
+        h_diag = cp.Parameter(self.action_dim, nonneg=True)
+        f_lin = cp.Parameter(self.action_dim)
         A_cbf = cp.Parameter((self.num_pairs, self.action_dim))
         b_cbf = cp.Parameter(self.num_pairs)
+        if self.num_obs_constraints > 0:
+            A_obs = cp.Parameter((self.num_obs_constraints, self.action_dim))
+            b_obs = cp.Parameter(self.num_obs_constraints)
+        else:
+            A_obs = None
+            b_obs = None
         A_clf = cp.Parameter((self.num_drones, self.action_dim))
         b_clf = cp.Parameter(self.num_drones)
         u_lb = cp.Parameter(self.action_dim)
         u_ub = cp.Parameter(self.action_dim)
 
         objective = cp.Minimize(
-            cp.sum_squares(u - u_nom)
-            + self.cfg.slack_weight * cp.sum_squares(slack_cbf)
-            + self.cfg.clf_slack_weight * cp.sum_squares(slack_clf)
+            0.5 * cp.sum(cp.multiply(h_diag, cp.square(u)))
+            + f_lin @ u
+            + self.cfg.clf_slack_weight * cp.sum(slack_clf)
+            + self.cfg.clf_slack_l2_weight * cp.sum_squares(slack_clf)
         )
-        constraints = [
-            A_cbf @ u <= b_cbf + slack_cbf,
-            A_clf @ u <= b_clf + slack_clf,
-            u >= u_lb,
-            u <= u_ub,
-        ]
+        constraints = [A_cbf @ u <= b_cbf]
+        if self.num_obs_constraints > 0:
+            constraints.append(A_obs @ u <= b_obs)
+        constraints.extend(
+            [
+                A_clf @ u <= b_clf + slack_clf,
+                u >= u_lb,
+                u <= u_ub,
+            ]
+        )
         problem = cp.Problem(objective, constraints)
 
         if not problem.is_dpp():
             raise RuntimeError("CBF-QP problem must satisfy DPP to be differentiable.")
 
         self._torch = torch
-        self._layer = CvxpyLayer(
-            problem,
-            parameters=[u_nom, A_cbf, b_cbf, A_clf, b_clf, u_lb, u_ub],
-            variables=[u, slack_cbf, slack_clf],
-        )
+        if self.num_obs_constraints > 0:
+            params = [h_diag, f_lin, A_cbf, b_cbf, A_obs, b_obs, A_clf, b_clf, u_lb, u_ub]
+        else:
+            params = [h_diag, f_lin, A_cbf, b_cbf, A_clf, b_clf, u_lb, u_ub]
+        self._layer = CvxpyLayer(problem, parameters=params, variables=[u, slack_clf])
+
+    def _build_obstacle_Ab(
+        self,
+        obstacle_A_nk3: np.ndarray | None,
+        obstacle_b_nk: np.ndarray | None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if self.num_obs_constraints <= 0:
+            return (
+                np.zeros((0, self.action_dim), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+            )
+
+        rows = self.num_obs_constraints
+        A = np.zeros((rows, self.action_dim), dtype=np.float32)
+        b = np.zeros((rows,), dtype=np.float32)
+        if obstacle_A_nk3 is None or obstacle_b_nk is None:
+            return A, b
+
+        A_in = np.asarray(obstacle_A_nk3, dtype=np.float32)
+        b_in = np.asarray(obstacle_b_nk, dtype=np.float32)
+        if A_in.ndim != 3 or b_in.ndim != 2:
+            return A, b
+        if A_in.shape[0] != self.num_drones or b_in.shape[0] != self.num_drones:
+            return A, b
+        if A_in.shape[1] != b_in.shape[1] or A_in.shape[2] != 3:
+            return A, b
+
+        k_use = min(int(A_in.shape[1]), int(self.max_obs_constraints_per_drone))
+        for i in range(self.num_drones):
+            s = i * self.max_obs_constraints_per_drone
+            e = s + k_use
+            A[s:e, 3 * i : 3 * i + 3] = A_in[i, :k_use, :]
+            b[s:e] = b_in[i, :k_use]
+
+        A = np.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+        b = np.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
+        return A, b
+
+    def _fallback_velocity(self, like_v: np.ndarray) -> np.ndarray:
+        """Safe fallback for solver failures: command zero velocity."""
+        v = np.zeros_like(like_v, dtype=np.float32)
+        return np.clip(v, self.vel_low[None, :], self.vel_high[None, :]).astype(np.float32)
 
     def _build_cbf_Ab(self, cbf_state: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, float]:
         A, b, _, d_min, h_min = compute_cbf_matrices_centralized(
@@ -142,6 +201,7 @@ class DifferentiableCBFQPSolver:
                 cruise_speed=self.cfg.cruise_speed,
                 accelerate_speed=self.cfg.accelerate_speed,
                 decelerate_speed=self.cfg.decelerate_speed,
+                skill_speed_cap=self.cfg.skill_speed_cap,
                 speed_clf_rate=self.cfg.clf_rate,
                 heading_clf_rate=self.cfg.heading_clf_rate,
                 speed_deadzone=self.cfg.speed_clf_deadzone,
@@ -170,7 +230,18 @@ class DifferentiableCBFQPSolver:
         )
         return A, b, True, mean_err, max_err
 
-    def solve_torch(self, cbf_state_t, v_des_t, target_pos_t=None, target_vel_t=None, skill_idx_t=None):
+    def solve_torch(
+        self,
+        cbf_state_t,
+        v_des_t,
+        target_pos_t=None,
+        target_vel_t=None,
+        skill_idx_t=None,
+        obstacle_A_t=None,
+        obstacle_b_t=None,
+        h_diag_t=None,
+        f_t=None,
+    ):
         """Differentiable solve (torch tensors)."""
         torch = self._torch
         if torch is None or self._layer is None:
@@ -186,17 +257,35 @@ class DifferentiableCBFQPSolver:
         target_pos_np = None if target_pos_t is None else target_pos_t.detach().cpu().numpy()
         target_vel_np = None if target_vel_t is None else target_vel_t.detach().cpu().numpy()
         skill_idx_np = None if skill_idx_t is None else skill_idx_t.detach().cpu().numpy()
+        obs_A_np = None if obstacle_A_t is None else obstacle_A_t.detach().cpu().numpy()
+        obs_b_np = None if obstacle_b_t is None else obstacle_b_t.detach().cpu().numpy()
+        A_obs_np, b_obs_np = self._build_obstacle_Ab(obs_A_np, obs_b_np)
         A_clf_np, b_clf_np, _, _, _ = self._build_clf_Ab(cbf_state_np, target_pos_np, target_vel_np, skill_idx_np)
         if not np.isfinite(A_np).all() or not np.isfinite(b_np).all():
             raise RuntimeError("Non-finite CBF matrices detected (A or b).")
+        if not np.isfinite(A_obs_np).all() or not np.isfinite(b_obs_np).all():
+            raise RuntimeError("Non-finite obstacle CBF matrices detected (A_obs or b_obs).")
         if not np.isfinite(A_clf_np).all() or not np.isfinite(b_clf_np).all():
             raise RuntimeError("Non-finite CLF matrices detected (A_clf or b_clf).")
 
         # diffcp+SCS is sensitive to dtype; float64 is significantly more stable than float32.
         dtype = torch.float64
         u_nom = v_des_t.reshape(-1).to(dtype=dtype)
+        if h_diag_t is None:
+            # Default: unconstrained optimum equals u_nom.
+            h_diag = torch.full_like(u_nom, 2.0, dtype=dtype)
+        else:
+            h_diag = h_diag_t.reshape(-1).to(dtype=dtype)
+            h_diag = torch.clamp(h_diag, min=float(self.cfg.qp_h_min))
+
+        if f_t is None:
+            f_lin = -h_diag * u_nom
+        else:
+            f_lin = f_t.reshape(-1).to(dtype=dtype)
         A = torch.as_tensor(np.ascontiguousarray(A_np, dtype=np.float64), dtype=dtype, device=u_nom.device)
         b = torch.as_tensor(np.ascontiguousarray(b_np, dtype=np.float64), dtype=dtype, device=u_nom.device)
+        A_obs = torch.as_tensor(np.ascontiguousarray(A_obs_np, dtype=np.float64), dtype=dtype, device=u_nom.device)
+        b_obs = torch.as_tensor(np.ascontiguousarray(b_obs_np, dtype=np.float64), dtype=dtype, device=u_nom.device)
         A_clf = torch.as_tensor(np.ascontiguousarray(A_clf_np, dtype=np.float64), dtype=dtype, device=u_nom.device)
         b_clf = torch.as_tensor(np.ascontiguousarray(b_clf_np, dtype=np.float64), dtype=dtype, device=u_nom.device)
         lb = torch.as_tensor(np.tile(self.vel_low, self.num_drones), dtype=dtype, device=u_nom.device)
@@ -208,18 +297,33 @@ class DifferentiableCBFQPSolver:
             "max_iters": self.cfg.max_iters,
         }
 
-        u_safe, slack_cbf, slack_clf = self._layer(
-            u_nom,
-            A,
-            b,
-            A_clf,
-            b_clf,
-            lb,
-            ub,
-            solver_args=solver_args,
-        )
-        slack_all = torch.cat([slack_cbf, slack_clf], dim=0)
-        return u_safe.reshape(self.num_drones, 3).to(v_des_t.dtype), slack_all.to(v_des_t.dtype)
+        if self.num_obs_constraints > 0:
+            u_safe, slack_clf = self._layer(
+                h_diag,
+                f_lin,
+                A,
+                b,
+                A_obs,
+                b_obs,
+                A_clf,
+                b_clf,
+                lb,
+                ub,
+                solver_args=solver_args,
+            )
+        else:
+            u_safe, slack_clf = self._layer(
+                h_diag,
+                f_lin,
+                A,
+                b,
+                A_clf,
+                b_clf,
+                lb,
+                ub,
+                solver_args=solver_args,
+            )
+        return u_safe.reshape(self.num_drones, 3).to(v_des_t.dtype), slack_clf.to(v_des_t.dtype)
 
     def __call__(
         self, cbf_state: np.ndarray, v_des: np.ndarray, last_info: Dict[str, Any]
@@ -235,8 +339,13 @@ class DifferentiableCBFQPSolver:
             target_pos_np = last_info.get("desired_positions", None)
             target_vel_np = last_info.get("target_velocity", None)
             skill_idx_np = last_info.get("skill_idx", None)
+            obs_A_in = last_info.get("obstacle_cbf_A", None)
+            obs_b_in = last_info.get("obstacle_cbf_b", None)
         else:
             skill_idx_np = None
+            obs_A_in = None
+            obs_b_in = None
+        A_obs_np, b_obs_np = self._build_obstacle_Ab(obs_A_in, obs_b_in)
         A_clf_np, b_clf_np, clf_on, clf_err_mean, clf_err_max = self._build_clf_Ab(
             cbf_state,
             target_pos_np,
@@ -245,17 +354,24 @@ class DifferentiableCBFQPSolver:
         )
         torch = self._torch
         if torch is None or self._layer is None:
-            return v_des, {"status": "missing_layer", "reason": "cvxpylayers not initialized"}
+            return self._fallback_velocity(v_des), {"status": "missing_layer", "reason": "cvxpylayers not initialized"}
 
         try:
             with torch.enable_grad():
                 if not np.isfinite(A_np).all() or not np.isfinite(b_np).all():
-                    return v_des, {"status": "invalid_cbf_matrix", "reason": "A or b contains non-finite values"}
+                    return self._fallback_velocity(v_des), {
+                        "status": "invalid_cbf_matrix",
+                        "reason": "A or b contains non-finite values",
+                    }
 
                 dtype = torch.float64
                 u_nom = torch.as_tensor(v_des.reshape(-1), dtype=dtype, device=self.device)
+                h_diag = torch.full_like(u_nom, 2.0, dtype=dtype)
+                f_lin = -h_diag * u_nom
                 A = torch.as_tensor(np.ascontiguousarray(A_np, dtype=np.float64), dtype=dtype, device=self.device)
                 b = torch.as_tensor(np.ascontiguousarray(b_np, dtype=np.float64), dtype=dtype, device=self.device)
+                A_obs = torch.as_tensor(np.ascontiguousarray(A_obs_np, dtype=np.float64), dtype=dtype, device=self.device)
+                b_obs = torch.as_tensor(np.ascontiguousarray(b_obs_np, dtype=np.float64), dtype=dtype, device=self.device)
                 A_clf = torch.as_tensor(np.ascontiguousarray(A_clf_np, dtype=np.float64), dtype=dtype, device=self.device)
                 b_clf = torch.as_tensor(np.ascontiguousarray(b_clf_np, dtype=np.float64), dtype=dtype, device=self.device)
                 lb = torch.as_tensor(np.tile(self.vel_low, self.num_drones), dtype=dtype, device=self.device)
@@ -266,20 +382,35 @@ class DifferentiableCBFQPSolver:
                     "eps": self.cfg.eps,
                     "max_iters": self.cfg.max_iters,
                 }
-                u_safe, slack_cbf, slack_clf = self._layer(
-                    u_nom,
-                    A,
-                    b,
-                    A_clf,
-                    b_clf,
-                    lb,
-                    ub,
-                    solver_args=solver_args,
-                )
+                if self.num_obs_constraints > 0:
+                    u_safe, slack_clf = self._layer(
+                        h_diag,
+                        f_lin,
+                        A,
+                        b,
+                        A_obs,
+                        b_obs,
+                        A_clf,
+                        b_clf,
+                        lb,
+                        ub,
+                        solver_args=solver_args,
+                    )
+                else:
+                    u_safe, slack_clf = self._layer(
+                        h_diag,
+                        f_lin,
+                        A,
+                        b,
+                        A_clf,
+                        b_clf,
+                        lb,
+                        ub,
+                        solver_args=solver_args,
+                    )
             v_safe = u_safe.detach().cpu().numpy().reshape(self.num_drones, 3).astype(np.float32)
-            slack_cbf_np = slack_cbf.detach().cpu().numpy().astype(np.float32)
             slack_clf_np = slack_clf.detach().cpu().numpy().astype(np.float32)
-            slack_np = np.concatenate([slack_cbf_np, slack_clf_np], axis=0)
+            slack_np = slack_clf_np
             info = {
                 "status": "ok",
                 "min_distance": d_min,
@@ -290,12 +421,13 @@ class DifferentiableCBFQPSolver:
                 "clf_metric_1": float(clf_err_mean) if np.isfinite(clf_err_mean) else np.nan,
                 "clf_metric_2": float(clf_err_max) if np.isfinite(clf_err_max) else np.nan,
                 "cbf_constraints": int(self.num_pairs),
+                "obs_constraints": int(self.num_obs_constraints),
                 "clf_constraints": int(self.num_drones) if clf_on else 0,
                 "clf_mode": self.cfg.clf_mode,
             }
             return v_safe, info
         except Exception as exc:
-            return v_des, {"status": "solver_error", "reason": str(exc)}
+            return self._fallback_velocity(v_des), {"status": "solver_error", "reason": str(exc)}
 
 
 def build_solver_from_velocity_bounds(

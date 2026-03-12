@@ -37,7 +37,8 @@ def scripted_action(
     # Virtual leader moves along +x; this creates a deterministic obstacle-crossing trajectory.
     leader_x = min(target_x, 0.95 * t)
     leader = np.array([leader_x, 0.0, env.cfg.desired_height], dtype=np.float32)
-    targets = leader[None, :] + build_line_offsets(n, env.cfg.formation_spacing)
+    formation_offsets = getattr(env, "_formation_offsets", build_line_offsets(n, env.cfg.formation_spacing))
+    targets = leader[None, :] + np.asarray(formation_offsets, dtype=np.float32)
 
     # Bridge crossing maneuver: compress lateral span and use vertical staggering.
     # Default bridge gap is narrow, so flat line formation cannot pass.
@@ -82,7 +83,16 @@ def scripted_action(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-drones", type=int, default=4)
-    parser.add_argument("--scenario", type=str, default="bridge_tree", choices=["none", "bridge", "tree", "bridge_tree"])
+    parser.add_argument("--scenario", type=str, default="bridge_tree", choices=["none", "bridge", "tree", "bridge_tree", "single_pillar"])
+    parser.add_argument("--formation-pattern", type=str, default="line", choices=["line", "square", "auto"])
+    parser.add_argument("--formation-spacing", type=float, default=0.3)
+    parser.add_argument("--use-moving-goal", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--goal-start-x", type=float, default=0.0)
+    parser.add_argument("--goal-start-y", type=float, default=0.0)
+    parser.add_argument("--goal-start-z", type=float, default=1.0)
+    parser.add_argument("--goal-end-x", type=float, default=0.0)
+    parser.add_argument("--goal-end-y", type=float, default=0.0)
+    parser.add_argument("--goal-end-z", type=float, default=1.0)
     parser.add_argument("--sensing-radius", type=float, default=3.0)
     parser.add_argument("--max-sensed-obstacles", type=int, default=3)
     parser.add_argument("--bridge-offset-y", type=float, default=0.40)
@@ -106,6 +116,15 @@ def main() -> None:
         num_drones=args.num_drones,
         gui=args.gui,
         scenario=args.scenario,
+        formation_pattern=args.formation_pattern,
+        formation_spacing=args.formation_spacing,
+        use_moving_goal=args.use_moving_goal,
+        goal_start_x=args.goal_start_x,
+        goal_start_y=args.goal_start_y,
+        goal_start_z=args.goal_start_z,
+        goal_end_x=args.goal_end_x,
+        goal_end_y=args.goal_end_y,
+        goal_end_z=args.goal_end_z,
         sensing_radius=args.sensing_radius,
         max_sensed_obstacles=args.max_sensed_obstacles,
         bridge_pillar_offset_y=args.bridge_offset_y,
@@ -171,11 +190,8 @@ def main() -> None:
                 if args.use_cbf_qp:
                     action = v_des
                 else:
-                    # Base env expects normalized action in [-1,1].
-                    action = np.zeros_like(v_des, dtype=np.float32)
-                    action[:, 0:2] = v_des[:, 0:2] / float(cfg.max_target_speed_xy)
-                    action[:, 2] = v_des[:, 2] / float(cfg.max_target_speed_z)
-                    action = np.clip(action, -1.0, 1.0)
+                    # Keep controller output in velocity (m/s), convert once at env boundary.
+                    action = base_env.velocity_to_normalized_action(v_des)
 
                 obs, reward, terminated, truncated, info = env.step(action)
                 total_reward += reward

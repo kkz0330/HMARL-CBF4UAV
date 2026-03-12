@@ -12,6 +12,7 @@ from .skill_conditioned_low_level import (
     SkillConditionedPolicyConfig,
     skill_velocity_alignment_reward,
 )
+from .high_level_policy import JointSkillActorCritic, HighLevelPolicyConfig
 from .differentiable_cbf_qp import (
     DifferentiableCBFQPConfig,
     DifferentiableCBFQPSolver,
@@ -27,6 +28,8 @@ __all__ = [
     "SkillConditionedActorCritic",
     "SkillConditionedPolicyConfig",
     "skill_velocity_alignment_reward",
+    "JointSkillActorCritic",
+    "HighLevelPolicyConfig",
     "FormationAviaryEnv",
     "FormationEnvConfig",
     "LocalObstacleEnvConfig",

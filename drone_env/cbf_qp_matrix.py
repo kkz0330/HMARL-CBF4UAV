@@ -159,8 +159,9 @@ def compute_skill_clf_matrices_centralized(
     state_n6: np.ndarray,
     skill_idx_n: np.ndarray,
     cruise_speed: float = 0.5,
-    accelerate_speed: float = 0.9,
+    accelerate_speed: float = 0.2,
     decelerate_speed: float = 0.2,
+    skill_speed_cap: float = 1.0,
     speed_clf_rate: float = 1.0,
     heading_clf_rate: float = 2.0,
     speed_deadzone: float = 0.08,
@@ -170,6 +171,10 @@ def compute_skill_clf_matrices_centralized(
 
     Skill mapping:
       0 cruise, 1 left, 2 right, 3 up, 4 down, 5 accelerate, 6 decelerate
+
+    Speed-skill semantics:
+      accelerate/decelerate use speed increments based on current forward speed v_x.
+      v_ref_x = clip(v_x +/- delta, 0, skill_speed_cap)
 
     Returns:
       A_clf: (N, 3N), b_clf: (N,), mode_flags: (N,)
@@ -196,6 +201,9 @@ def compute_skill_clf_matrices_centralized(
 
     speed_deadzone = max(float(speed_deadzone), 0.0)
     heading_deadzone = max(float(heading_deadzone), 0.0)
+    speed_cap = max(float(skill_speed_cap), 0.0)
+    accel_delta = max(float(accelerate_speed), 0.0)
+    decel_delta = max(float(decelerate_speed), 0.0)
 
     for i in range(n):
         z = int(skills[i])
@@ -206,9 +214,9 @@ def compute_skill_clf_matrices_centralized(
             if z == 0:
                 speed_ref = float(cruise_speed)
             elif z == 5:
-                speed_ref = float(accelerate_speed)
+                speed_ref = float(np.clip(max(float(v_i[0]), 0.0) + accel_delta, 0.0, speed_cap))
             else:
-                speed_ref = float(decelerate_speed)
+                speed_ref = float(np.clip(max(float(v_i[0]), 0.0) - decel_delta, 0.0, speed_cap))
             v_ref = speed_ref * d_forward
             e = v_i - v_ref
             e_norm = float(np.linalg.norm(e))

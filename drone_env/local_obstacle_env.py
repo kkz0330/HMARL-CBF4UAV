@@ -23,7 +23,7 @@ class ObstacleSpec:
 class LocalObstacleEnvConfig(FormationEnvConfig):
     sensing_radius: float = 3.0
     max_sensed_obstacles: int = 3
-    scenario: str = "bridge_tree"  # options: bridge, tree, bridge_tree, none
+    scenario: str = "bridge_tree"  # options: bridge, tree, bridge_tree, single_pillar, none
     bridge_x: float = 1.8
     bridge_pillar_offset_y: float = 0.40
     bridge_pillar_half_x: float = 0.15
@@ -36,6 +36,12 @@ class LocalObstacleEnvConfig(FormationEnvConfig):
     bridge_beam_xy_margin: float = 0.02
     obstacle_clearance: float = 0.25
     obstacle_cbf_alpha: float = 4.0
+    use_ground_cbf: bool = True
+    single_pillar_x: float = 2.0
+    single_pillar_y: float = 0.0
+    single_pillar_half_x: float = 0.35
+    single_pillar_half_y: float = 0.35
+    single_pillar_half_z: float = 1.0
     include_neighbor_features: bool = True
     _dummy: int = field(default=0, repr=False)  # dataclass inheritance compatibility
 
@@ -165,6 +171,7 @@ class LocalObstacleFormationEnv(FormationAviaryEnv):
 
         use_bridge = self.cfg.scenario in {"bridge", "bridge_tree"}
         use_tree = self.cfg.scenario in {"tree", "bridge_tree"}
+        use_single_pillar = self.cfg.scenario == "single_pillar"
 
         if use_bridge:
             # Narrow bridge opening: drones must reconfigure to pass.
@@ -184,6 +191,18 @@ class LocalObstacleFormationEnv(FormationAviaryEnv):
             # Trunk + canopy.
             add_cylinder([3.4, 0.0, 0.6], radius=0.18, height=1.2, rgba=[0.45, 0.28, 0.12, 1.0], kind="tree_trunk")
             add_sphere([3.4, 0.0, 1.55], radius=0.55, rgba=[0.1, 0.6, 0.15, 1.0], kind="tree_canopy")
+
+        if use_single_pillar:
+            add_box(
+                [float(self.cfg.single_pillar_x), float(self.cfg.single_pillar_y), float(self.cfg.single_pillar_half_z)],
+                [
+                    float(self.cfg.single_pillar_half_x),
+                    float(self.cfg.single_pillar_half_y),
+                    float(self.cfg.single_pillar_half_z),
+                ],
+                [0.7, 0.5, 0.3, 1.0],
+                "single_pillar",
+            )
 
     def _remove_scene_obstacles(self) -> None:
         if self._sim_env is None:
@@ -326,12 +345,12 @@ class LocalObstacleFormationEnv(FormationAviaryEnv):
         return [x[1] for x in sensed[: self.cfg.max_sensed_obstacles]]
 
     def _obstacle_xy_radius(self, obs: ObstacleSpec) -> float:
-        if obs.kind in {"bridge_pillar", "bridge_beam"} and obs.half_extents is not None:
+        if obs.kind in {"bridge_pillar", "bridge_beam", "single_pillar"} and obs.half_extents is not None:
             return float(np.linalg.norm(obs.half_extents[0:2]))
         return float(obs.radius)
 
     def _distance_for_sensing(self, drone_pos: np.ndarray, obs: ObstacleSpec) -> float:
-        if obs.kind == "bridge_pillar" and obs.half_extents is not None:
+        if obs.kind in {"bridge_pillar", "single_pillar"} and obs.half_extents is not None:
             return float(np.linalg.norm(drone_pos[0:2] - obs.position[0:2]))
         return float(np.linalg.norm(drone_pos - obs.position))
 
@@ -345,7 +364,7 @@ class LocalObstacleFormationEnv(FormationAviaryEnv):
         return z_low, z_high
 
     def _compute_obstacle_clearance(self, drone_pos: np.ndarray, obs: ObstacleSpec) -> float:
-        if self.cfg.use_bridge_pillar_25d_cbf and obs.kind == "bridge_pillar" and obs.half_extents is not None:
+        if self.cfg.use_bridge_pillar_25d_cbf and obs.kind in {"bridge_pillar", "single_pillar"} and obs.half_extents is not None:
             z_low, z_high = self._bridge_pillar_height_band(obs)
             if drone_pos[2] < z_low or drone_pos[2] > z_high:
                 return float("inf")
@@ -365,7 +384,7 @@ class LocalObstacleFormationEnv(FormationAviaryEnv):
         return float(center_dist - float(obs.radius) - float(self.cfg.obstacle_clearance))
 
     def _build_single_obstacle_cbf(self, drone_pos: np.ndarray, obs: ObstacleSpec) -> Tuple[np.ndarray, float] | None:
-        if self.cfg.use_bridge_pillar_25d_cbf and obs.kind == "bridge_pillar" and obs.half_extents is not None:
+        if self.cfg.use_bridge_pillar_25d_cbf and obs.kind in {"bridge_pillar", "single_pillar"} and obs.half_extents is not None:
             z_low, z_high = self._bridge_pillar_height_band(obs)
             if drone_pos[2] < z_low or drone_pos[2] > z_high:
                 return None
@@ -395,6 +414,19 @@ class LocalObstacleFormationEnv(FormationAviaryEnv):
         b = float(self.cfg.obstacle_cbf_alpha * h_io)
         return A, b
 
+    def _build_ground_cbf(self, drone_pos: np.ndarray) -> Tuple[np.ndarray, float]:
+        """Always-on ground half-space CBF to avoid descending below fall_z_threshold.
+
+        h(z) = z - z_min,  h_dot = u_z.
+        CBF: h_dot + alpha*h >= 0  ->  -u_z <= alpha * (z - z_min).
+        """
+        z = float(drone_pos[2])
+        z_min = float(self.cfg.fall_z_threshold)
+        alpha = float(self.cfg.obstacle_cbf_alpha)
+        A = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        b = float(alpha * (z - z_min))
+        return A, b
+
     def get_obstacle_cbf_matrices(
         self, raw_obs: Any | None = None, cbf_state: np.ndarray | None = None
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -421,8 +453,14 @@ class LocalObstacleFormationEnv(FormationAviaryEnv):
         b_obs = np.zeros((n, kmax), dtype=np.float32)
 
         for i in range(n):
-            sensed = self.get_sensed_obstacles_for_drone(pos[i])
             k = 0
+            if bool(self.cfg.use_ground_cbf) and k < kmax:
+                A_k, b_k = self._build_ground_cbf(pos[i])
+                A_obs[i, k, :] = A_k
+                b_obs[i, k] = b_k
+                k += 1
+
+            sensed = self.get_sensed_obstacles_for_drone(pos[i])
             for obs in sensed:
                 if k >= kmax:
                     break

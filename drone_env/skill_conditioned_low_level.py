@@ -18,6 +18,11 @@ class SkillConditionedPolicyConfig:
     action_scale_z: float = 1.0
     log_std_min: float = -4.0
     log_std_max: float = 0.5
+    use_parametric_qp: bool = True
+    qp_h_base: float = 2.0
+    qp_h_min: float = 1e-3
+    qp_f_scale: float = 0.5
+    qp_only: bool = True
 
 
 def skills_to_onehot(skill_idx: torch.Tensor, num_skills: int) -> torch.Tensor:
@@ -53,7 +58,10 @@ class SkillConditionedActorCritic(nn.Module):
         )
         self.policy_head = nn.Linear(self.cfg.hidden_dim, 3)
         self.value_head = nn.Linear(self.cfg.hidden_dim, 1)
+        self.qp_h_head = nn.Linear(self.cfg.hidden_dim, 3)
+        self.qp_f_head = nn.Linear(self.cfg.hidden_dim, 3)
         self.log_std = nn.Parameter(torch.full((3,), self.cfg.init_log_std))
+        self._softplus = nn.Softplus()
 
     def _build_features(self, obs_local: torch.Tensor, skill_idx: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
         # obs_local: (B, N, D), skill_idx: (B, N), tau: (B, 1) or (B, N, 1)
@@ -79,6 +87,38 @@ class SkillConditionedActorCritic(nn.Module):
         std = torch.exp(log_std).view(1, 1, 3).expand_as(mean)
         return mean, std, value
 
+    def qp_objective_params(
+        self,
+        obs_local: torch.Tensor,
+        skill_idx: torch.Tensor,
+        tau: torch.Tensor,
+        u_nom: torch.Tensor | None,
+        nominal_anchor_weight: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute parametric QP objective terms from phi = Gamma_nu(o|z)."""
+        anchor_w = 0.0 if bool(self.cfg.qp_only) else float(nominal_anchor_weight)
+        if u_nom is None:
+            u_nom_term = torch.zeros(
+                (obs_local.shape[0], obs_local.shape[1], 3),
+                dtype=obs_local.dtype,
+                device=obs_local.device,
+            )
+        else:
+            u_nom_term = u_nom
+        if not self.cfg.use_parametric_qp:
+            h_diag = torch.full_like(u_nom_term, float(self.cfg.qp_h_base))
+            f_lin = -anchor_w * h_diag * u_nom_term
+            return h_diag, f_lin
+
+        feat = self._build_features(obs_local, skill_idx, tau)
+        h = self.backbone(feat)
+        h_delta = self._softplus(self.qp_h_head(h))
+        h_diag = float(self.cfg.qp_h_base) + h_delta + float(self.cfg.qp_h_min)
+        f_delta = self.qp_f_head(h)
+        # Base term keeps unconstrained optimum near u_nom, delta term learns task shaping.
+        f_lin = -anchor_w * h_diag * u_nom_term + float(self.cfg.qp_f_scale) * f_delta
+        return h_diag, f_lin
+
     def act(
         self,
         obs_local: torch.Tensor,
@@ -88,19 +128,40 @@ class SkillConditionedActorCritic(nn.Module):
         qp_target_pos: torch.Tensor | None = None,
         qp_target_vel: torch.Tensor | None = None,
         qp_skill_idx: torch.Tensor | None = None,
+        qp_obstacle_A: torch.Tensor | None = None,
+        qp_obstacle_b: torch.Tensor | None = None,
         qp_solver=None,
+        qp_nominal_anchor_weight: float = 1.0,
         deterministic: bool = False,
     ) -> Dict[str, torch.Tensor]:
         # Single-step rollout call, with batch size B=1 expected.
         mean, std, value = self.forward(obs_local, skill_idx, tau)
-        dist = Normal(mean, std)
-        if deterministic:
-            u_nom = mean
+        if bool(self.cfg.qp_only):
+            u_nom = torch.zeros_like(mean)
+            logp = torch.zeros((mean.shape[0], mean.shape[1]), dtype=mean.dtype, device=mean.device)
+            entropy_joint = torch.zeros((mean.shape[0],), dtype=mean.dtype, device=mean.device)
+            qp_v_des = torch.zeros_like(mean)
+            u_nom_for_obj = None
         else:
-            u_nom = dist.rsample()
-        logp = dist.log_prob(u_nom).sum(dim=-1)  # (B, N)
+            dist = Normal(mean, std)
+            if deterministic:
+                u_nom = mean
+            else:
+                u_nom = dist.rsample()
+            logp = dist.log_prob(u_nom).sum(dim=-1)  # (B, N)
+            entropy_joint = dist.entropy().sum(dim=-1).mean(dim=-1)  # (B,)
+            qp_v_des = u_nom
+            u_nom_for_obj = u_nom
 
-        u_safe = u_nom
+        qp_h_diag, qp_f = self.qp_objective_params(
+            obs_local,
+            skill_idx,
+            tau,
+            u_nom_for_obj,
+            nominal_anchor_weight=qp_nominal_anchor_weight,
+        )
+
+        u_safe = qp_v_des
         slack = torch.zeros((u_nom.shape[0], 1), dtype=u_nom.dtype, device=u_nom.device)
         if qp_solver is not None:
             safe_list = []
@@ -111,16 +172,22 @@ class SkillConditionedActorCritic(nn.Module):
                     target_b = None if qp_target_pos is None else qp_target_pos[b]
                     target_vel_b = None if qp_target_vel is None else qp_target_vel[b]
                     skill_b = None if qp_skill_idx is None else qp_skill_idx[b]
+                    obs_A_b = None if qp_obstacle_A is None else qp_obstacle_A[b]
+                    obs_b_b = None if qp_obstacle_b is None else qp_obstacle_b[b]
                     u_b, s_b = qp_solver.solve_torch(
                         cbf_state[b],
-                        u_nom[b],
+                        qp_v_des[b],
                         target_pos_t=target_b,
                         target_vel_t=target_vel_b,
                         skill_idx_t=skill_b,
+                        obstacle_A_t=obs_A_b,
+                        obstacle_b_t=obs_b_b,
+                        h_diag_t=qp_h_diag[b],
+                        f_t=qp_f[b],
                     )
                 except Exception:
-                    # Fallback to nominal action for this sample to keep training loop alive.
-                    u_b = u_nom[b]
+                    # Keep the loop alive while avoiding unsafe nominal-action bypass.
+                    u_b = torch.zeros_like(u_nom[b])
                     s_b = torch.zeros((1,), dtype=u_nom.dtype, device=u_nom.device)
                     qp_fail_count += 1
                 safe_list.append(u_b)
@@ -138,11 +205,13 @@ class SkillConditionedActorCritic(nn.Module):
             "logp_joint": logp.sum(dim=-1),  # (B,)
             "value_agent": value,  # (B, N)
             "value_joint": value.mean(dim=-1),  # (B,)
-            "entropy_joint": dist.entropy().sum(dim=-1).mean(dim=-1),  # (B,)
+            "entropy_joint": entropy_joint,  # (B,)
             "slack_aux": slack.squeeze(-1),  # (B,)
             "qp_fail_count": torch.as_tensor([qp_fail_count], dtype=torch.int32, device=obs_local.device),
             "mean": mean,
             "std": std,
+            "qp_h_diag": qp_h_diag,
+            "qp_f": qp_f,
         }
 
 

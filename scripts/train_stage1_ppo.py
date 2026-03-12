@@ -77,25 +77,23 @@ class NumpyCBFQPSolver:
             cbf_state, safe_distance=self.safe_distance, alpha=self.alpha
         )
         n_u = 3 * self.num_drones
-        n_c = A.shape[0]
-
         u = cp.Variable(n_u)
-        slack = cp.Variable(n_c, nonneg=True)
         u_nom = v_des.reshape(-1)
         lb = np.tile(self.vel_low, self.num_drones)
         ub = np.tile(self.vel_high, self.num_drones)
-        obj = cp.Minimize(cp.sum_squares(u - u_nom) + 50.0 * cp.sum_squares(slack))
-        cons = [A @ u <= b + slack, u >= lb, u <= ub]
+        obj = cp.Minimize(cp.sum_squares(u - u_nom))
+        cons = [A @ u <= b, u >= lb, u <= ub]
         prob = cp.Problem(obj, cons)
         prob.solve(solver=cp.OSQP, warm_start=True, verbose=False)
         if u.value is None:
             prob.solve(solver=cp.SCS, warm_start=True, verbose=False)
         if u.value is None:
-            return v_des, {"status": "infeasible", "min_distance": float(min_d), "min_h": float(min_h), "slack_l2": np.nan}
-        slack_v = np.asarray(slack.value if slack.value is not None else np.zeros(n_c), dtype=np.float32)
+            v_zero = np.zeros_like(v_des, dtype=np.float32)
+            v_zero = np.clip(v_zero, self.vel_low[None, :], self.vel_high[None, :]).astype(np.float32)
+            return v_zero, {"status": "infeasible", "min_distance": float(min_d), "min_h": float(min_h), "slack_l2": 0.0}
         return (
             np.asarray(u.value, dtype=np.float32).reshape(self.num_drones, 3),
-            {"status": "ok", "min_distance": float(min_d), "min_h": float(min_h), "slack_l2": float(np.linalg.norm(slack_v))},
+            {"status": "ok", "min_distance": float(min_d), "min_h": float(min_h), "slack_l2": 0.0},
         )
 
 
@@ -237,16 +235,19 @@ def main():
             if use_diff_qp:
                 cbf_t = torch.as_tensor(cbf_state, dtype=torch.float32, device=device)
                 target_t = torch.as_tensor(desired_now, dtype=torch.float32, device=device)
-                u_safe, slack = solver.solve_torch(cbf_t, u_nom, target_pos_t=target_t)
-                action_np = u_safe.detach().cpu().numpy().astype(np.float32)
+                try:
+                    u_safe, slack = solver.solve_torch(cbf_t, u_nom, target_pos_t=target_t)
+                except Exception:
+                    u_safe = torch.zeros_like(u_nom)
+                    slack = torch.zeros((args.num_drones,), dtype=u_nom.dtype, device=u_nom.device)
+                v_safe_np = u_safe.detach().cpu().numpy().astype(np.float32)
                 slack_norm = float(np.linalg.norm(slack.detach().cpu().numpy()))
             else:
-                action_np, qp_info = numpy_solver(cbf_state, u_nom_np)
+                v_safe_np, qp_info = numpy_solver(cbf_state, u_nom_np)
                 slack_norm = float(qp_info.get("slack_l2", np.nan))
 
-            next_obs, reward, terminated, truncated, next_info = env.step(
-                action_np
-            )
+            # Keep policy/QP action in velocity (m/s), convert only at env boundary.
+            next_obs, reward, terminated, truncated, next_info = env.step_velocity(v_safe_np)
             done = bool(terminated or truncated)
 
             obs_buf[t] = obs
@@ -329,12 +330,19 @@ def main():
                         u_nom_j = mean_b[j].reshape(args.num_drones, 3)
                         cbf_j = b_cbf[j]
                         target_j = b_target[j]
-                        u_safe_j, slack_j = solver.solve_torch(cbf_j, u_nom_j, target_pos_t=target_j)
+                        try:
+                            u_safe_j, slack_j = solver.solve_torch(cbf_j, u_nom_j, target_pos_t=target_j)
+                        except Exception:
+                            u_safe_j = torch.zeros_like(u_nom_j)
+                            slack_j = torch.zeros((args.num_drones,), dtype=u_nom_j.dtype, device=u_nom_j.device)
                         qp_aux = qp_aux + torch.mean((u_safe_j - u_nom_j) ** 2) + 0.1 * torch.mean(slack_j**2)
 
                         u_probe = u_nom_j.detach().clone().requires_grad_(True)
-                        u_safe_probe, _ = solver.solve_torch(cbf_j, u_probe, target_pos_t=target_j)
-                        g = torch.autograd.grad(u_safe_probe.sum(), u_probe, retain_graph=False, create_graph=False)[0]
+                        try:
+                            u_safe_probe, _ = solver.solve_torch(cbf_j, u_probe, target_pos_t=target_j)
+                            g = torch.autograd.grad(u_safe_probe.sum(), u_probe, retain_graph=False, create_graph=False)[0]
+                        except Exception:
+                            g = torch.zeros_like(u_probe)
                         qp_grad_probe = qp_grad_probe + torch.mean(torch.abs(g.detach()))
                     qp_aux = qp_aux / b_obs.shape[0]
                     qp_grad_probe = qp_grad_probe / b_obs.shape[0]

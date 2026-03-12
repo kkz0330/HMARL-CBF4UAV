@@ -46,11 +46,6 @@ class RLCBFQPWrapper(gym.Wrapper):
             [env.cfg.max_target_speed_xy, env.cfg.max_target_speed_xy, env.cfg.max_target_speed_z],
             dtype=np.float32,
         )
-        self._vel_scale = np.array(
-            [env.cfg.max_target_speed_xy, env.cfg.max_target_speed_xy, env.cfg.max_target_speed_z],
-            dtype=np.float32,
-        )
-
         # PPO-facing action space (absolute target velocity in m/s).
         self.action_space = spaces.Box(
             low=np.tile(self._vel_low, (self._num_drones, 1)),
@@ -109,8 +104,7 @@ class RLCBFQPWrapper(gym.Wrapper):
         self.qp_solver = qp_solver
 
     def _velocity_to_normalized(self, velocity: np.ndarray) -> np.ndarray:
-        eps = 1e-6
-        return np.clip(velocity / (self._vel_scale[None, :] + eps), -1.0, 1.0).astype(np.float32)
+        return self.env.velocity_to_normalized_action(velocity)
 
     @staticmethod
     def _to_numpy_or_none(x: Any) -> Any:

@@ -43,8 +43,9 @@ class PPOConfig:
 def compute_gae(
     rewards: np.ndarray,
     values: np.ndarray,
-    dones: np.ndarray,
-    last_value: float,
+    next_values: np.ndarray,
+    episode_dones: np.ndarray,
+    terminals: np.ndarray,
     gamma: float,
     gae_lambda: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -52,10 +53,11 @@ def compute_gae(
     adv = np.zeros(t_len, dtype=np.float32)
     last_gae = 0.0
     for t in reversed(range(t_len)):
-        next_nonterminal = 1.0 - dones[t]
-        next_value = last_value if t == t_len - 1 else values[t + 1]
+        next_nonterminal = 1.0 - terminals[t]
+        next_value = next_values[t]
         delta = rewards[t] + gamma * next_value * next_nonterminal - values[t]
-        last_gae = delta + gamma * gae_lambda * next_nonterminal * last_gae
+        # Cut GAE recursion at any episode boundary, but keep timeout bootstrap.
+        last_gae = delta + gamma * gae_lambda * (1.0 - episode_dones[t]) * last_gae
         adv[t] = last_gae
     ret = adv + values
     return adv, ret
@@ -67,11 +69,31 @@ def batch_indices(n: int, batch_size: int):
         yield perm[s : s + batch_size]
 
 
-def velocities_to_normalized(v_cmd: np.ndarray, max_xy: float, max_z: float) -> np.ndarray:
-    act = np.zeros_like(v_cmd, dtype=np.float32)
-    act[:, 0:2] = v_cmd[:, 0:2] / float(max_xy)
-    act[:, 2] = v_cmd[:, 2] / float(max_z)
-    return np.clip(act, -1.0, 1.0).astype(np.float32)
+def linear_anneal_weight(
+    update: int,
+    total_updates: int,
+    start_weight: float,
+    end_weight: float,
+    start_frac: float,
+    end_frac: float,
+) -> float:
+    total = max(int(total_updates), 1)
+    s = float(np.clip(start_frac, 0.0, 1.0))
+    e = float(np.clip(end_frac, 0.0, 1.0))
+    if e < s:
+        e = s
+
+    if total <= 1:
+        alpha = 1.0
+    else:
+        p = (float(update) - 1.0) / float(total - 1)
+        if p <= s:
+            alpha = 0.0
+        elif p >= e:
+            alpha = 1.0
+        else:
+            alpha = (p - s) / max(e - s, 1e-8)
+    return float((1.0 - alpha) * float(start_weight) + alpha * float(end_weight))
 
 
 def parse_skill_set(skill_set_text: str, num_skills: int) -> np.ndarray:
@@ -122,10 +144,29 @@ def build_skill_reference_velocity(
     cruise_speed: float,
     accelerate_speed: float,
     decelerate_speed: float,
+    vel_now_n3: np.ndarray | None = None,
+    speed_cap: float | None = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Reference heading (unit vector) and speed per skill."""
+    """Reference heading (unit vector) and speed per skill.
+
+    For speed skills:
+      - cruise(0): target speed = cruise_speed
+      - accelerate(5): target speed = clip(vx_now + accelerate_speed, 0, speed_cap)
+      - decelerate(6): target speed = clip(vx_now - decelerate_speed, 0, speed_cap)
+    """
     z = np.asarray(skill_idx, dtype=np.int64).reshape(-1)
     n = z.shape[0]
+    if vel_now_n3 is None:
+        vel_now = np.zeros((n, 3), dtype=np.float32)
+    else:
+        vel_now = np.asarray(vel_now_n3, dtype=np.float32)
+        if vel_now.shape != (n, 3):
+            raise ValueError(f"vel_now_n3 must have shape {(n, 3)}, got {vel_now.shape}")
+
+    spd_cap = float("inf") if speed_cap is None else float(max(speed_cap, 0.0))
+    accel_delta = float(max(accelerate_speed, 0.0))
+    decel_delta = float(max(decelerate_speed, 0.0))
+
     ref_dir = np.zeros((n, 3), dtype=np.float32)
     ref_speed = np.full((n,), float(cruise_speed), dtype=np.float32)
     for i in range(n):
@@ -142,12 +183,97 @@ def build_skill_reference_velocity(
             ref_dir[i] = np.array([1.0, 0.0, 0.0], dtype=np.float32)  # cruise/accelerate/decelerate
 
         if zi == 5:
-            ref_speed[i] = float(accelerate_speed)
+            base = max(float(vel_now[i, 0]), 0.0)
+            ref_speed[i] = float(np.clip(base + accel_delta, 0.0, spd_cap))
         elif zi == 6:
-            ref_speed[i] = float(decelerate_speed)
+            base = max(float(vel_now[i, 0]), 0.0)
+            ref_speed[i] = float(np.clip(base - decel_delta, 0.0, spd_cap))
         else:
             ref_speed[i] = float(cruise_speed)
     return ref_dir, ref_speed
+
+
+def in_skill_initiation_set(obs_i: np.ndarray, min_altitude: float = 0.2) -> bool:
+    """Initiation set I_z(o): basic state validity for starting a new skill."""
+    x = np.asarray(obs_i, dtype=np.float32).reshape(-1)
+    if x.size < 3 or not np.isfinite(x).all():
+        return False
+    return bool(float(x[2]) >= float(min_altitude))
+
+
+def evaluate_skill_termination(
+    pos_n3: np.ndarray,
+    vel_n3: np.ndarray,
+    target_n3: np.ndarray,
+    skill_idx_n: np.ndarray,
+    age_after_n: np.ndarray,
+    t_max_n: np.ndarray,
+    ref_dir_n3: np.ndarray,
+    ref_speed_n: np.ndarray,
+    pos_tol: float,
+    speed_tol: float,
+    heading_tol: float,
+    min_duration: int,
+    pos_guard_scale: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Termination function Phi_z(o,t): success in J_z or timeout T_max."""
+    pos = np.asarray(pos_n3, dtype=np.float32)
+    vel = np.asarray(vel_n3, dtype=np.float32)
+    target = np.asarray(target_n3, dtype=np.float32)
+    z = np.asarray(skill_idx_n, dtype=np.int64).reshape(-1)
+    age_after = np.asarray(age_after_n, dtype=np.int64).reshape(-1)
+    t_max = np.asarray(t_max_n, dtype=np.int64).reshape(-1)
+    ref_dir = np.asarray(ref_dir_n3, dtype=np.float32)
+    ref_speed = np.asarray(ref_speed_n, dtype=np.float32).reshape(-1)
+
+    n = z.shape[0]
+    term = np.zeros((n,), dtype=bool)
+    succ = np.zeros((n,), dtype=bool)
+    tout = np.zeros((n,), dtype=bool)
+
+    pos_tol = float(max(pos_tol, 1e-4))
+    speed_tol = float(max(speed_tol, 1e-4))
+    heading_tol = float(max(heading_tol, 1e-4))
+    min_duration = int(max(min_duration, 0))
+    pos_guard = pos_tol * float(max(pos_guard_scale, 1.0))
+
+    for i in range(n):
+        if int(age_after[i]) < min_duration:
+            continue
+
+        timeout_i = bool(int(age_after[i]) >= int(t_max[i]))
+        if timeout_i:
+            term[i] = True
+            tout[i] = True
+            continue
+
+        pos_err = float(np.linalg.norm(pos[i] - target[i]))
+        speed = float(np.linalg.norm(vel[i]))
+        zi = int(z[i])
+
+        if zi in (1, 2, 3, 4):
+            # Lateral/vertical skills: terminate on reaching offset target and slowing down.
+            success_i = (pos_err <= pos_tol) and (speed <= speed_tol)
+        else:
+            # Cruise/accel/decel: terminate on speed/heading tracking and no large position drift.
+            speed_err = abs(speed - float(ref_speed[i]))
+            vxy = vel[i, 0:2]
+            dxy = ref_dir[i, 0:2]
+            nv = float(np.linalg.norm(vxy))
+            nd = float(np.linalg.norm(dxy))
+            if nv < 1e-4 or nd < 1e-4:
+                heading_ok = speed <= speed_tol
+            else:
+                cos_h = float(np.clip(np.dot(vxy, dxy) / (nv * nd + 1e-6), -1.0, 1.0))
+                heading_err = float(np.arccos(cos_h))
+                heading_ok = heading_err <= heading_tol
+            success_i = (speed_err <= speed_tol) and heading_ok and (pos_err <= pos_guard)
+
+        if success_i:
+            term[i] = True
+            succ[i] = True
+
+    return term, succ, tout
 
 
 def build_policy_obs(
@@ -241,7 +367,22 @@ def sample_initial_skill_schedule(
 def main() -> None:
     parser = argparse.ArgumentParser(description="White-box low-level PPO pretraining with random skill commands")
     parser.add_argument("--num-drones", type=int, default=4)
-    parser.add_argument("--scenario", type=str, default="bridge_tree", choices=["none", "bridge", "tree", "bridge_tree"])
+    parser.add_argument("--scenario", type=str, default="single_pillar", choices=["none", "bridge", "tree", "bridge_tree", "single_pillar"])
+    parser.add_argument("--formation-pattern", type=str, default="line", choices=["line", "square", "auto"])
+    parser.add_argument("--formation-spacing", type=float, default=0.3)
+    parser.add_argument("--use-moving-goal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--goal-start-x", type=float, default=0.0)
+    parser.add_argument("--goal-start-y", type=float, default=0.0)
+    parser.add_argument("--goal-start-z", type=float, default=1.0)
+    parser.add_argument("--goal-end-x", type=float, default=4.0)
+    parser.add_argument("--goal-end-y", type=float, default=0.0)
+    parser.add_argument("--goal-end-z", type=float, default=1.0)
+    parser.add_argument("--goal-speed", type=float, default=0.5)
+    parser.add_argument("--single-pillar-x", type=float, default=2.0)
+    parser.add_argument("--single-pillar-y", type=float, default=0.0)
+    parser.add_argument("--fall-z-threshold", type=float, default=0.15)
+    parser.add_argument("--fall-penalty", type=float, default=10.0)
+    parser.add_argument("--terminate-on-fall", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--total-updates", type=int, default=120)
     parser.add_argument("--rollout-steps", type=int, default=256)
     parser.add_argument("--num-skills", type=int, default=7)
@@ -254,6 +395,12 @@ def main() -> None:
     parser.add_argument("--skill-period-min", type=int, default=40)
     parser.add_argument("--skill-period-max", type=int, default=60)
     parser.add_argument("--skill-stay-prob", type=float, default=0.85)
+    parser.add_argument("--skill-init-min-alt", type=float, default=0.2)
+    parser.add_argument("--skill-min-duration", type=int, default=8)
+    parser.add_argument("--skill-term-pos-tol", type=float, default=0.18)
+    parser.add_argument("--skill-term-speed-tol", type=float, default=0.18)
+    parser.add_argument("--skill-term-heading-tol", type=float, default=0.40)
+    parser.add_argument("--skill-term-pos-guard-scale", type=float, default=3.0)
     parser.add_argument(
         "--lock-skill-per-episode",
         action=argparse.BooleanOptionalAction,
@@ -265,7 +412,7 @@ def main() -> None:
     parser.add_argument("--delta-z", type=float, default=0.25)
     parser.add_argument("--skill-target-sigma", type=float, default=0.35)
     parser.add_argument("--reset-err-threshold", type=float, default=3.0)
-    parser.add_argument("--reward-clip", type=float, default=3.0)
+    parser.add_argument("--reward-clip", type=float, default=0.0)
     parser.add_argument("--teacher-kp", type=float, default=1.2)
     parser.add_argument("--teacher-kd", type=float, default=0.25)
     parser.add_argument("--teacher-loss-coef", type=float, default=0.5)
@@ -273,6 +420,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--gui", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--low-level-qp-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--episode-len-sec", type=float, default=20.0)
     parser.add_argument("--bridge-offset-y", type=float, default=0.40)
     parser.add_argument("--diff-qp", action=argparse.BooleanOptionalAction, default=True)
@@ -285,8 +433,16 @@ def main() -> None:
     parser.add_argument("--qp-heading-clf-deadzone", type=float, default=0.08)
     parser.add_argument("--qp-clf-slack-weight", type=float, default=80.0)
     parser.add_argument("--skill-cruise-speed", type=float, default=0.5)
-    parser.add_argument("--skill-accelerate-speed", type=float, default=0.9)
-    parser.add_argument("--skill-decelerate-speed", type=float, default=0.2)
+    parser.add_argument("--skill-accelerate-speed", type=float, default=0.2, help="Forward speed increment for accelerate skill (m/s).")
+    parser.add_argument("--skill-decelerate-speed", type=float, default=0.2, help="Forward speed decrement for decelerate skill (m/s).")
+    parser.add_argument("--use-parametric-qp-objective", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--qp-h-base", type=float, default=2.0)
+    parser.add_argument("--qp-h-min", type=float, default=1e-3)
+    parser.add_argument("--qp-f-scale", type=float, default=0.5)
+    parser.add_argument("--u-nom-anchor-start", type=float, default=1.0)
+    parser.add_argument("--u-nom-anchor-end", type=float, default=0.0)
+    parser.add_argument("--u-nom-anchor-anneal-start-frac", type=float, default=0.0)
+    parser.add_argument("--u-nom-anchor-anneal-end-frac", type=float, default=1.0)
     parser.add_argument("--w-skill", type=float, default=1.0)
     parser.add_argument("--w-align", type=float, default=0.8)
     parser.add_argument("--align-distance-gating", action=argparse.BooleanOptionalAction, default=True)
@@ -302,6 +458,12 @@ def main() -> None:
     parser.add_argument("--w-safety", type=float, default=2.0)
     parser.add_argument("--w-contact", type=float, default=6.0)
     parser.add_argument("--w-env", type=float, default=0.0)
+    parser.add_argument("--c1-action", type=float, default=0.05)
+    parser.add_argument("--c2-vel", type=float, default=0.60)
+    parser.add_argument("--c3-heading", type=float, default=0.25)
+    parser.add_argument("--c4-pos", type=float, default=0.35)
+    parser.add_argument("--v-des-eps", type=float, default=0.10)
+    parser.add_argument("--heading-speed-min", type=float, default=0.05)
     parser.add_argument("--w-progress", type=float, default=0.25)
     parser.add_argument("--w-accel-pen", type=float, default=0.15)
     parser.add_argument("--w-turn-pen", type=float, default=0.20)
@@ -312,6 +474,8 @@ def main() -> None:
     parser.add_argument("--debug-progress-scale", type=float, default=10.0)
     parser.add_argument("--debug-goal-threshold", type=float, default=0.10)
     parser.add_argument("--debug-goal-bonus", type=float, default=50.0)
+    parser.add_argument("--save-path", type=str, default="")
+    parser.add_argument("--save-every", type=int, default=20)
     parser.add_argument(
         "--debug-progress-agent",
         type=int,
@@ -331,14 +495,24 @@ def main() -> None:
         raise SystemExit("skill-stay-prob must be in [0,1]")
     if args.num_skills <= 0:
         raise SystemExit("num-skills must be positive")
+    if args.skill_min_duration < 0:
+        raise SystemExit("skill-min-duration must be >= 0")
+    if args.skill_term_pos_tol <= 0.0 or args.skill_term_speed_tol <= 0.0 or args.skill_term_heading_tol <= 0.0:
+        raise SystemExit("skill termination tolerances must be > 0")
     if args.skill_cruise_speed < 0.0 or args.skill_accelerate_speed < 0.0 or args.skill_decelerate_speed < 0.0:
         raise SystemExit("skill speeds must be non-negative")
-    if not (args.skill_decelerate_speed <= args.skill_cruise_speed <= args.skill_accelerate_speed):
-        raise SystemExit("Require decelerate_speed <= cruise_speed <= accelerate_speed")
     if args.align_gate_far <= args.align_gate_near:
         raise SystemExit("align-gate-far must be larger than align-gate-near")
     if not (0.0 <= args.align_gate_min <= 1.0):
         raise SystemExit("align-gate-min must be in [0,1]")
+    if args.fall_z_threshold < 0.0 or args.fall_penalty < 0.0:
+        raise SystemExit("fall-z-threshold and fall-penalty must be non-negative")
+    if args.goal_speed < 0.0:
+        raise SystemExit("goal-speed must be non-negative")
+    if args.u_nom_anchor_anneal_start_frac < 0.0 or args.u_nom_anchor_anneal_end_frac > 1.0:
+        raise SystemExit("u-nom-anchor anneal fractions must be within [0,1]")
+    if args.u_nom_anchor_anneal_end_frac < args.u_nom_anchor_anneal_start_frac:
+        raise SystemExit("u-nom-anchor-anneal-end-frac must be >= start-frac")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -352,8 +526,23 @@ def main() -> None:
             num_drones=args.num_drones,
             gui=args.gui,
             scenario=args.scenario,
+            formation_pattern=args.formation_pattern,
+            formation_spacing=args.formation_spacing,
+            use_moving_goal=args.use_moving_goal,
+            goal_start_x=args.goal_start_x,
+            goal_start_y=args.goal_start_y,
+            goal_start_z=args.goal_start_z,
+            goal_end_x=args.goal_end_x,
+            goal_end_y=args.goal_end_y,
+            goal_end_z=args.goal_end_z,
+            goal_speed=args.goal_speed,
+            single_pillar_x=args.single_pillar_x,
+            single_pillar_y=args.single_pillar_y,
             bridge_pillar_offset_y=args.bridge_offset_y,
             episode_len_sec=args.episode_len_sec,
+            fall_z_threshold=args.fall_z_threshold,
+            fall_penalty=args.fall_penalty,
+            terminate_on_fall=args.terminate_on_fall,
         )
     )
     obs, info = env.reset(seed=args.seed)
@@ -368,6 +557,11 @@ def main() -> None:
             hidden_dim=256,
             action_scale_xy=env.cfg.max_target_speed_xy,
             action_scale_z=env.cfg.max_target_speed_z,
+            use_parametric_qp=args.use_parametric_qp_objective,
+            qp_h_base=args.qp_h_base,
+            qp_h_min=args.qp_h_min,
+            qp_f_scale=args.qp_f_scale,
+            qp_only=args.low_level_qp_only,
         ),
     ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=ppo_cfg.lr)
@@ -392,9 +586,12 @@ def main() -> None:
                 speed_clf_deadzone=args.qp_speed_clf_deadzone,
                 heading_clf_deadzone=args.qp_heading_clf_deadzone,
                 clf_slack_weight=args.qp_clf_slack_weight,
+                qp_h_min=args.qp_h_min,
                 cruise_speed=args.skill_cruise_speed,
                 accelerate_speed=args.skill_accelerate_speed,
                 decelerate_speed=args.skill_decelerate_speed,
+                skill_speed_cap=env.cfg.max_target_speed_xy,
+                max_obstacle_constraints_per_drone=env.cfg.max_sensed_obstacles,
             ),
             device=args.device,
         )
@@ -405,7 +602,11 @@ def main() -> None:
         k_min=args.skill_period_min,
         k_max=args.skill_period_max,
     )
+    for i in range(args.num_drones):
+        if not in_skill_initiation_set(obs[i], min_altitude=args.skill_init_min_alt):
+            current_skills[i] = 0
     prev_u_safe = np.zeros((args.num_drones, 3), dtype=np.float32)
+    switched_mask_next = np.zeros((args.num_drones,), dtype=bool)
 
     desired_init = np.asarray(info["desired_positions"], dtype=np.float32)
     target_init = build_skill_targets(desired_init, current_skills, args.delta_x, args.delta_y, args.delta_z)
@@ -417,10 +618,22 @@ def main() -> None:
     recent_returns: List[float] = []
 
     for update in range(1, args.total_updates + 1):
+        u_nom_anchor_w = linear_anneal_weight(
+            update=update,
+            total_updates=args.total_updates,
+            start_weight=args.u_nom_anchor_start,
+            end_weight=args.u_nom_anchor_end,
+            start_frac=args.u_nom_anchor_anneal_start_frac,
+            end_frac=args.u_nom_anchor_anneal_end_frac,
+        )
+        if args.low_level_qp_only:
+            u_nom_anchor_w = 0.0
         obs_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, obs_dim), dtype=np.float32)
         skill_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones), dtype=np.int64)
         tau_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 1), dtype=np.float32)
         cbf_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 6), dtype=np.float32)
+        obs_cbf_A_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, env.cfg.max_sensed_obstacles, 3), dtype=np.float32)
+        obs_cbf_b_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, env.cfg.max_sensed_obstacles), dtype=np.float32)
         target_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 3), dtype=np.float32)
         u_nom_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 3), dtype=np.float32)
         teacher_buf = np.zeros((ppo_cfg.rollout_steps, args.num_drones, 3), dtype=np.float32)
@@ -428,16 +641,17 @@ def main() -> None:
         val_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         rew_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         done_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        terminal_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        next_val_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         skill_score_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         align_raw_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         align_gate_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         align_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-        progress_x_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-        accel_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-        turn_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-        speed_ref_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-        heading_ref_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-        pos_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        intrinsic_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        action_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        vel_rel_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        heading_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        pos_sq_pen_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         skill_prog_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         skill_err_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         slack_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
@@ -447,20 +661,14 @@ def main() -> None:
         teacher_mse_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         debug_dist_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         debug_reward_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        term_success_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+        term_timeout_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
         switch_count = 0
 
         for t in range(ppo_cfg.rollout_steps):
-            # Asynchronous per-agent skill schedule with persistence.
-            switched_mask = np.zeros((args.num_drones,), dtype=bool)
-            if not args.lock_skill_per_episode:
-                for i in range(args.num_drones):
-                    if skill_ages[i] >= skill_periods[i]:
-                        if np.random.rand() > args.skill_stay_prob:
-                            current_skills[i] = int(np.random.choice(allowed_skills))
-                        skill_periods[i] = int(np.random.randint(args.skill_period_min, args.skill_period_max + 1))
-                        skill_ages[i] = 0
-                        switched_mask[i] = True
-                        switch_count += 1
+            # Asynchronous skill update from previous-step termination Phi_z(o,t).
+            switched_mask = switched_mask_next.copy()
+            switched_mask_next[:] = False
 
             tau_vec = np.clip(skill_ages / np.maximum(skill_periods - 1, 1), 0.0, 1.0).astype(np.float32)
 
@@ -487,6 +695,16 @@ def main() -> None:
             cbf_t = torch.as_tensor(cbf_state[None, ...], dtype=torch.float32, device=device)
             target_t = torch.as_tensor(target_now[None, ...], dtype=torch.float32, device=device)
             target_vel_t = torch.zeros_like(target_t)
+            obs_A_now = np.asarray(
+                info.get("obstacle_cbf_A", np.zeros((args.num_drones, env.cfg.max_sensed_obstacles, 3), dtype=np.float32)),
+                dtype=np.float32,
+            )
+            obs_b_now = np.asarray(
+                info.get("obstacle_cbf_b", np.zeros((args.num_drones, env.cfg.max_sensed_obstacles), dtype=np.float32)),
+                dtype=np.float32,
+            )
+            obs_A_t = torch.as_tensor(obs_A_now[None, ...], dtype=torch.float32, device=device)
+            obs_b_t = torch.as_tensor(obs_b_now[None, ...], dtype=torch.float32, device=device)
 
             with torch.no_grad():
                 out = model.act(
@@ -497,7 +715,10 @@ def main() -> None:
                     qp_target_pos=target_t,
                     qp_target_vel=target_vel_t,
                     qp_skill_idx=skill_t,
+                    qp_obstacle_A=obs_A_t,
+                    qp_obstacle_b=obs_b_t,
                     qp_solver=qp_solver,
+                    qp_nominal_anchor_weight=u_nom_anchor_w,
                     deterministic=False,
                 )
 
@@ -509,11 +730,7 @@ def main() -> None:
             qp_fail_count = int(out.get("qp_fail_count", torch.zeros((1,), dtype=torch.int32))[0].cpu().item())
             qp_fail_ratio = float(qp_fail_count) / float(args.num_drones)
 
-            action = velocities_to_normalized(
-                u_safe,
-                max_xy=env.cfg.max_target_speed_xy,
-                max_z=env.cfg.max_target_speed_z,
-            )
+            action = env.velocity_to_normalized_action(u_safe)
             next_obs, env_reward, terminated, truncated, next_info = env.step(action)
             done = bool(terminated or truncated)
 
@@ -549,29 +766,40 @@ def main() -> None:
             align_reward = gate * align_reward_raw
             skill_score = align_reward
 
-            # Intrinsic terms: mostly penalties + small forward progress reward.
-            forward_progress = float(np.mean(np.clip(pos_next[:, 0] - pos_now[:, 0], -0.10, 0.10)))
-            accel_pen = float(np.mean(np.sum((vel_next - vel_now) ** 2, axis=1)))
-
-            v_now_norm = np.linalg.norm(vel_now, axis=1)
             v_next_norm = np.linalg.norm(vel_next, axis=1)
-            dot_turn = np.sum(vel_now * vel_next, axis=1)
-            cos_turn = dot_turn / (v_now_norm * v_next_norm + 1e-6)
-            cos_turn = np.clip(cos_turn, -1.0, 1.0)
-            # map to [0,1], small when heading changes are smooth
-            turn_pen = float(np.mean(0.5 * (1.0 - cos_turn)))
-
             ref_dir, ref_speed = build_skill_reference_velocity(
                 current_skills,
                 cruise_speed=args.skill_cruise_speed,
                 accelerate_speed=args.skill_accelerate_speed,
                 decelerate_speed=args.skill_decelerate_speed,
+                vel_now_n3=vel_now,
+                speed_cap=env.cfg.max_target_speed_xy,
             )
-            speed_ref_pen = float(np.mean((v_next_norm - ref_speed) ** 2))
-            cos_ref = np.sum(vel_next * ref_dir, axis=1) / (v_next_norm + 1e-6)
-            cos_ref = np.clip(cos_ref, -1.0, 1.0)
-            heading_ref_pen = float(np.mean(0.5 * (1.0 - cos_ref)))
-            pos_pen = float(mean_err_next)
+
+            # Reward from user-provided formula:
+            # r_L^i = -c1||a^i||^2 - c2((v^i-v_des)/v_des)^2 - c3((psi^i-psi_des)/pi)^2 - c4||d^i||^2
+            action_pen = float(np.mean(np.sum(u_safe**2, axis=1)))
+            vel_rel = (v_next_norm - ref_speed) / np.maximum(ref_speed, float(args.v_des_eps))
+            vel_rel_pen = float(np.mean(vel_rel**2))
+
+            psi = np.arctan2(vel_next[:, 1], vel_next[:, 0])
+            psi_des = np.arctan2(ref_dir[:, 1], ref_dir[:, 0])
+            dpsi = np.arctan2(np.sin(psi - psi_des), np.cos(psi - psi_des))
+            heading_mask = (
+                np.linalg.norm(ref_dir[:, 0:2], axis=1) > 1e-6
+            ) & (np.linalg.norm(vel_next[:, 0:2], axis=1) > float(args.heading_speed_min))
+            if np.any(heading_mask):
+                heading_pen = float(np.mean((dpsi[heading_mask] / np.pi) ** 2))
+            else:
+                heading_pen = 0.0
+
+            pos_sq_pen = float(np.mean(np.sum((pos_next - target_next) ** 2, axis=1)))
+            intrinsic_reward = -(
+                float(args.c1_action) * action_pen
+                + float(args.c2_vel) * vel_rel_pen
+                + float(args.c3_heading) * heading_pen
+                + float(args.c4_pos) * pos_sq_pen
+            )
 
             pair_margin = float(next_info["min_pairwise_distance"] - env.cfg.safe_distance)
             obs_clear = float(next_info["min_obstacle_clearance"])
@@ -584,20 +812,7 @@ def main() -> None:
 
             reward = (
                 args.w_env * float(env_reward)
-                + args.w_progress * forward_progress
-                + args.w_align * align_reward
-                - args.w_accel_pen * accel_pen
-                - args.w_turn_pen * turn_pen
-                - args.w_speed_ref_pen * speed_ref_pen
-                - args.w_heading_ref_pen * heading_ref_pen
-                - args.w_pos_pen * pos_pen
-                - args.w_smooth * smooth_pen
-                - args.w_intervene * intervene_pen
-                - args.w_slack * slack_aux
-                - args.w_speed * speed_pen
-                - args.w_qp_fail * qp_fail_ratio
-                - args.w_safety * safety_violation
-                - args.w_contact * contact
+                + intrinsic_reward
             )
             if args.reward_clip > 0.0:
                 reward = float(np.clip(reward, -args.reward_clip, args.reward_clip))
@@ -629,6 +844,8 @@ def main() -> None:
             skill_buf[t] = current_skills
             tau_buf[t, :, 0] = tau_vec
             cbf_buf[t] = cbf_state
+            obs_cbf_A_buf[t] = obs_A_now
+            obs_cbf_b_buf[t] = obs_b_now
             target_buf[t] = target_now
             u_nom_buf[t] = u_nom
             logp_buf[t] = logp_agent
@@ -639,12 +856,11 @@ def main() -> None:
             align_raw_buf[t] = align_reward_raw
             align_gate_buf[t] = gate
             align_buf[t] = align_reward
-            progress_x_buf[t] = forward_progress
-            accel_pen_buf[t] = accel_pen
-            turn_pen_buf[t] = turn_pen
-            speed_ref_pen_buf[t] = speed_ref_pen
-            heading_ref_pen_buf[t] = heading_ref_pen
-            pos_pen_buf[t] = pos_pen
+            intrinsic_buf[t] = intrinsic_reward
+            action_pen_buf[t] = action_pen
+            vel_rel_pen_buf[t] = vel_rel_pen
+            heading_pen_buf[t] = heading_pen
+            pos_sq_pen_buf[t] = pos_sq_pen
             skill_prog_buf[t] = skill_progress
             skill_err_buf[t] = mean_err_next
             slack_buf[t] = slack_aux
@@ -657,7 +873,71 @@ def main() -> None:
             info = next_info
             cbf_state = np.asarray(next_info["cbf_state"], dtype=np.float32)
             prev_u_safe = u_safe
-            skill_ages += 1
+            age_after = skill_ages + 1
+
+            # Phi_z(o,t)=1 if o in J_z or timeout; otherwise 0.
+            term_mask, succ_mask, tout_mask = evaluate_skill_termination(
+                pos_n3=pos_next,
+                vel_n3=vel_next,
+                target_n3=target_next,
+                skill_idx_n=current_skills,
+                age_after_n=age_after,
+                t_max_n=skill_periods,
+                ref_dir_n3=ref_dir,
+                ref_speed_n=ref_speed,
+                pos_tol=args.skill_term_pos_tol,
+                speed_tol=args.skill_term_speed_tol,
+                heading_tol=args.skill_term_heading_tol,
+                min_duration=args.skill_min_duration,
+                pos_guard_scale=args.skill_term_pos_guard_scale,
+            )
+            term_success_buf[t] = float(np.mean(succ_mask.astype(np.float32)))
+            term_timeout_buf[t] = float(np.mean(tout_mask.astype(np.float32)))
+            skill_ages = age_after
+
+            if not args.lock_skill_per_episode:
+                for i in range(args.num_drones):
+                    if not term_mask[i]:
+                        continue
+                    if np.random.rand() > args.skill_stay_prob:
+                        candidate = int(np.random.choice(allowed_skills))
+                    else:
+                        candidate = int(current_skills[i])
+                    if not in_skill_initiation_set(obs[i], min_altitude=args.skill_init_min_alt):
+                        candidate = 0
+                    current_skills[i] = candidate
+                    skill_periods[i] = int(np.random.randint(args.skill_period_min, args.skill_period_max + 1))
+                    skill_ages[i] = 0
+                    switched_mask_next[i] = True
+                    switch_count += 1
+
+            # Bootstrap value from the true post-step state before any env.reset().
+            with torch.no_grad():
+                tau_next = np.clip(skill_ages / np.maximum(skill_periods - 1, 1), 0.0, 1.0).astype(np.float32)
+                desired_next_for_value = np.asarray(info["desired_positions"], dtype=np.float32)
+                target_next_for_value = build_skill_targets(
+                    desired_next_for_value, current_skills, args.delta_x, args.delta_y, args.delta_z
+                )
+                policy_obs_next = build_policy_obs(
+                    obs,
+                    target_next_for_value,
+                    use_delta_feature=args.use_delta_feature,
+                    normalize_obs=args.normalize_obs,
+                    num_drones=args.num_drones,
+                    max_sensed_obstacles=env.cfg.max_sensed_obstacles,
+                    include_neighbor_features=env.cfg.include_neighbor_features,
+                    pos_scale=args.obs_pos_scale,
+                    vel_scale=args.obs_vel_scale,
+                    clip_val=args.obs_clip,
+                )
+                obs_next_t = torch.as_tensor(policy_obs_next[None, ...], dtype=torch.float32, device=device)
+                skill_next_t = torch.as_tensor(current_skills[None, ...], dtype=torch.long, device=device)
+                tau_next_t = torch.as_tensor(tau_next[None, :, None], dtype=torch.float32, device=device)
+                _, _, value_next_agent = model.forward(obs_next_t, skill_next_t, tau_next_t)
+                next_val_buf[t] = float(value_next_agent.mean(dim=-1).cpu().numpy()[0])
+
+            # True terminal includes env termination + manual debug termination; pure timeout is non-terminal.
+            terminal_buf[t] = float(bool(terminated) or bool(done and not truncated))
 
             if done:
                 recent_returns.append(ep_return)
@@ -671,6 +951,10 @@ def main() -> None:
                     k_min=args.skill_period_min,
                     k_max=args.skill_period_max,
                 )
+                for i in range(args.num_drones):
+                    if not in_skill_initiation_set(obs[i], min_altitude=args.skill_init_min_alt):
+                        current_skills[i] = 0
+                switched_mask_next[:] = False
                 desired_reset = np.asarray(info["desired_positions"], dtype=np.float32)
                 target_reset = build_skill_targets(
                     desired_reset, current_skills, args.delta_x, args.delta_y, args.delta_z
@@ -679,35 +963,12 @@ def main() -> None:
                 err_reset = np.linalg.norm(pos_reset - target_reset, axis=1)
                 last_progress_dist_n[:] = err_reset.astype(np.float32)
 
-        with torch.no_grad():
-            tau_vec = np.clip(skill_ages / np.maximum(skill_periods - 1, 1), 0.0, 1.0).astype(np.float32)
-            desired_last = np.asarray(info["desired_positions"], dtype=np.float32)
-            target_last = build_skill_targets(
-                desired_last, current_skills, args.delta_x, args.delta_y, args.delta_z
-            )
-            policy_obs_last = build_policy_obs(
-                obs,
-                target_last,
-                use_delta_feature=args.use_delta_feature,
-                normalize_obs=args.normalize_obs,
-                num_drones=args.num_drones,
-                max_sensed_obstacles=env.cfg.max_sensed_obstacles,
-                include_neighbor_features=env.cfg.include_neighbor_features,
-                pos_scale=args.obs_pos_scale,
-                vel_scale=args.obs_vel_scale,
-                clip_val=args.obs_clip,
-            )
-            obs_t = torch.as_tensor(policy_obs_last[None, ...], dtype=torch.float32, device=device)
-            skill_t = torch.as_tensor(current_skills[None, ...], dtype=torch.long, device=device)
-            tau_t = torch.as_tensor(tau_vec[None, :, None], dtype=torch.float32, device=device)
-            _, _, value_last_agent = model.forward(obs_t, skill_t, tau_t)
-            last_value = float(value_last_agent.mean(dim=-1).cpu().numpy()[0])
-
         adv, ret = compute_gae(
             rewards=rew_buf,
             values=val_buf,
-            dones=done_buf,
-            last_value=last_value,
+            next_values=next_val_buf,
+            episode_dones=done_buf,
+            terminals=terminal_buf,
             gamma=ppo_cfg.gamma,
             gae_lambda=ppo_cfg.gae_lambda,
         )
@@ -717,6 +978,8 @@ def main() -> None:
         skill_t = torch.as_tensor(skill_buf, dtype=torch.long, device=device)
         tau_t = torch.as_tensor(tau_buf, dtype=torch.float32, device=device)
         cbf_t = torch.as_tensor(cbf_buf, dtype=torch.float32, device=device)
+        obs_cbf_A_t = torch.as_tensor(obs_cbf_A_buf, dtype=torch.float32, device=device)
+        obs_cbf_b_t = torch.as_tensor(obs_cbf_b_buf, dtype=torch.float32, device=device)
         target_t = torch.as_tensor(target_buf, dtype=torch.float32, device=device)
         u_nom_t = torch.as_tensor(u_nom_buf, dtype=torch.float32, device=device)
         old_logp_t = torch.as_tensor(logp_buf, dtype=torch.float32, device=device)
@@ -730,6 +993,8 @@ def main() -> None:
                 b_skill = skill_t[idx]
                 b_tau = tau_t[idx]
                 b_cbf = cbf_t[idx]
+                b_obsA = obs_cbf_A_t[idx]
+                b_obsb = obs_cbf_b_t[idx]
                 b_target = target_t[idx]
                 b_nom = u_nom_t[idx]
                 b_old_logp = old_logp_t[idx]
@@ -738,16 +1003,28 @@ def main() -> None:
 
                 mean_b, std_b, value_agent_b = model.forward(b_obs, b_skill, b_tau)
                 value_b = value_agent_b.mean(dim=-1)
-                dist_b = Normal(mean_b, std_b)
-                # Per-agent PPO ratio (MAPPO-style), avoid high-dimensional joint log-prob explosion.
-                logp_b = dist_b.log_prob(b_nom).sum(dim=-1)  # (B, N)
-                entropy_b = dist_b.entropy().sum(dim=-1).mean()
+                if args.low_level_qp_only:
+                    policy_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+                    entropy_b = torch.tensor(0.0, dtype=torch.float32, device=device)
+                else:
+                    dist_b = Normal(mean_b, std_b)
+                    # Per-agent PPO ratio (MAPPO-style), avoid high-dimensional joint log-prob explosion.
+                    logp_b = dist_b.log_prob(b_nom).sum(dim=-1)  # (B, N)
+                    entropy_b = dist_b.entropy().sum(dim=-1).mean()
+                qp_h_b, qp_f_b = model.qp_objective_params(
+                    b_obs,
+                    b_skill,
+                    b_tau,
+                    None if args.low_level_qp_only else mean_b,
+                    nominal_anchor_weight=u_nom_anchor_w,
+                )
 
-                b_adv_expanded = b_adv.unsqueeze(1).expand(-1, args.num_drones)
-                ratio = torch.exp(logp_b - b_old_logp)  # (B, N)
-                surr1 = ratio * b_adv_expanded
-                surr2 = torch.clamp(ratio, 1.0 - ppo_cfg.clip_ratio, 1.0 + ppo_cfg.clip_ratio) * b_adv_expanded
-                policy_loss = -torch.min(surr1, surr2).mean()
+                if not args.low_level_qp_only:
+                    b_adv_expanded = b_adv.unsqueeze(1).expand(-1, args.num_drones)
+                    ratio = torch.exp(logp_b - b_old_logp)  # (B, N)
+                    surr1 = ratio * b_adv_expanded
+                    surr2 = torch.clamp(ratio, 1.0 - ppo_cfg.clip_ratio, 1.0 + ppo_cfg.clip_ratio) * b_adv_expanded
+                    policy_loss = -torch.min(surr1, surr2).mean()
                 value_loss = 0.5 * ((value_b - b_ret) ** 2).mean()
 
                 qp_aux = torch.tensor(0.0, dtype=torch.float32, device=device)
@@ -756,21 +1033,29 @@ def main() -> None:
                     slack_list = []
                     for j in range(mean_b.shape[0]):
                         try:
+                            qp_v_des_j = torch.zeros_like(mean_b[j]) if args.low_level_qp_only else mean_b[j]
                             u_safe_j, slack_j = qp_solver.solve_torch(
                                 b_cbf[j],
-                                mean_b[j],
+                                qp_v_des_j,
                                 target_pos_t=b_target[j],
                                 target_vel_t=torch.zeros_like(b_target[j]),
                                 skill_idx_t=b_skill[j],
+                                obstacle_A_t=b_obsA[j],
+                                obstacle_b_t=b_obsb[j],
+                                h_diag_t=qp_h_b[j],
+                                f_t=qp_f_b[j],
                             )
                         except Exception:
-                            u_safe_j = mean_b[j]
+                            u_safe_j = torch.zeros_like(mean_b[j])
                             slack_j = torch.zeros((1,), dtype=mean_b.dtype, device=mean_b.device)
                         safe_list.append(u_safe_j)
                         slack_list.append(torch.mean(slack_j**2))
                     safe_stack = torch.stack(safe_list, dim=0)
                     slack_stack = torch.stack(slack_list, dim=0)
-                    qp_aux = torch.mean((safe_stack - mean_b) ** 2) + 0.1 * torch.mean(slack_stack)
+                    if args.low_level_qp_only:
+                        qp_aux = 0.1 * torch.mean(slack_stack)
+                    else:
+                        qp_aux = torch.mean((safe_stack - mean_b) ** 2) + 0.1 * torch.mean(slack_stack)
 
                 loss = (
                     policy_loss
@@ -792,23 +1077,39 @@ def main() -> None:
             f"rollout_align_raw={float(np.mean(align_raw_buf)):.3f} "
             f"rollout_align_gate={float(np.mean(align_gate_buf)):.3f} "
             f"rollout_align={float(np.mean(align_buf)):.3f} "
-            f"rollout_prog_x={float(np.mean(progress_x_buf)):.4f} "
-            f"rollout_accel_pen={float(np.mean(accel_pen_buf)):.4f} "
-            f"rollout_turn_pen={float(np.mean(turn_pen_buf)):.4f} "
-            f"rollout_speed_ref_pen={float(np.mean(speed_ref_pen_buf)):.4f} "
-            f"rollout_heading_ref_pen={float(np.mean(heading_ref_pen_buf)):.4f} "
-            f"rollout_pos_pen={float(np.mean(pos_pen_buf)):.4f} "
+            f"rollout_intrinsic={float(np.mean(intrinsic_buf)):.4f} "
+            f"rollout_action_pen={float(np.mean(action_pen_buf)):.4f} "
+            f"rollout_vel_rel_pen={float(np.mean(vel_rel_pen_buf)):.4f} "
+            f"rollout_heading_pen={float(np.mean(heading_pen_buf)):.4f} "
+            f"rollout_pos_sq_pen={float(np.mean(pos_sq_pen_buf)):.4f} "
             f"rollout_skill_progress={float(np.mean(skill_prog_buf)):.4f} "
             f"rollout_skill_err={float(np.mean(skill_err_buf)):.3f} "
+            f"rollout_term_succ={float(np.mean(term_success_buf)):.3f} "
+            f"rollout_term_timeout={float(np.mean(term_timeout_buf)):.3f} "
             f"rollout_intervene={float(np.mean(intervene_buf)):.4f} "
             f"rollout_slack={float(np.mean(slack_buf)):.4f} "
             f"rollout_qp_fail={float(np.mean(qp_fail_buf)):.4f} "
             f"rollout_contact={float(np.mean(contact_buf)):.4f} "
             f"switches={switch_count} qp_aux={last_qp_aux:.4f} diff_qp={args.diff_qp} "
+            f"ll_qp_only={args.low_level_qp_only} "
+            f"u_nom_anchor_w={u_nom_anchor_w:.3f} "
             f"debug_mode={args.debug_progress_reward} "
             f"debug_dist={float(np.mean(debug_dist_buf)):.3f} "
             f"debug_reward={float(np.mean(debug_reward_buf)):.3f}"
         )
+
+        if args.save_path and (update % max(int(args.save_every), 1) == 0 or update == args.total_updates):
+            save_dir = os.path.dirname(args.save_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            payload = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "update": update,
+                "args": vars(args),
+                "obs_dim": int(obs_dim),
+            }
+            torch.save(payload, args.save_path)
 
     env.close()
 
